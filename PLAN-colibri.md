@@ -395,12 +395,29 @@ at 250K, 24 heads, 8 rows = 734 ms and 16 rows = **696 ms (1.05×)**; at 64 synt
 overflows the 96 KiB tile and the dispatch falls back to the scalar kernel (20.5 s vs 1.77 s), so
 16 is only for a group ≤ 4. Default stays 8 — the 5% is inside the run-to-run spread.
 
-**MTP — dropped from this plan.** The import used `--no-mtp`, and a fresh import of
-`Inkling-2-Mini-UD-IQ3_XXS.gguf` finds no MTP tensors either. The DSpark drafter exists only as a
-separate GGUF (`dspark-Inkling-2-Mini-Q8_0.gguf`) for llama.cpp's speculative path, not as this
-engine's MTP head, and even with a head the MoE verify step costs more per accepted token than a
-plain step (it activates the union of the drafts' experts). It is not an open item: it needs a
-snapshot that ships the head, and it is not on the 250K speed path until one exists.
+**MTP vs DSpark — two different mechanisms, and neither is wired here.** This was first written
+up as "dropped"; that was too quick. The facts:
+
+- **DSpark is the official option**, and it is a *separate draft model*:
+  `dspark-Inkling-2-Mini-Q8_0.gguf`, 402 MB, GGUF architecture **`dflash`**. llama.cpp loads it with
+  `-md … --spec-type draft-dspark --spec-draft-n-max 3`, which is exactly what the Unsloth baseline
+  in §2 does — so that 18.33 tok/s at 64K is *with* DSpark.
+- **This engine's `INK2_MTP` is a different thing**: `inkling2_mtp.h` reads an in-snapshot head,
+  `<snap>/mtp/mtp.safetensors` + `config.json`'s `mtp_config`, and drafts with the DFlare scheme off
+  the target's own fused layers. The container has no `mtp/` directory, so `ink2m_load` says "no
+  mtp/mtp.safetensors beside it". A re-import without `--no-mtp` does not produce one either — the
+  head is not in this GGUF.
+- `coli import` refuses the DSpark file as a model (`architecture 'dflash' is not supported yet`).
+  The engine has DFlash *kernels* (`cuda_dflash.cuh`, the `cc_dfconv`/`cc_dftopk` ops) for the
+  family that integrates a drafter, but not a loader/verify path for an external `dflash` drafter
+  beside inkling2.
+
+So DSpark is not "a snapshot away": it needs engine work (load a `dflash` drafter, run its forward
+and block verify, own its KV). Before that work, size the prize: run llama.cpp on the same prompt
+**with and without `-md`** at 8K/64K — it already supports DSpark, so that isolates what the
+drafter is worth in this exact MoE + q4-KV setting. With ~612 s of host experts at 250K, a verify
+of k drafts activates the union of k+1 tokens' top-8 experts, so the per-verify cost is the thing
+to measure, not the accept rate alone. Keep it as an item gated on that measurement.
 
 ## 15. The typed-mirror upload bug (the real reason the output was garbage)
 
