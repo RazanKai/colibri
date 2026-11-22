@@ -220,6 +220,10 @@ typedef struct {
     unsigned long long frames, waits, ops, matmuls, bytes_up, bytes_down;
     double wait_ms;      /* host time blocked in event waits */
     size_t dev_bytes;    /* live chain buffers on the device */
+    /* the attention kernels' own time on the stream (CCG_RA_TIMING=1), so the engine's
+     * device side splits into attention and the rest: cuda_inkc.cuh's cc_relattn records
+     * CUDA events around its launches, cc_stats drains them */
+    double ra_ms; unsigned long long ra_calls;
 } CcStats;
 
 /* The table the backend exports. `size` is the backend's sizeof: a field past it is

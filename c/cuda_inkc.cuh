@@ -620,10 +620,36 @@ static float *cc_relattn_part(size_t bytes) {
     if (cap < bytes) { cc_free(b); b = cc_buf(bytes, CC_DEV); cap = b ? bytes : 0; }
     return b ? (float *)(void *)fp(b) : nullptr;
 }
+/* CCG_RA_TIMING=1: an event pair around the attention kernels, into cuda_chain.cu's g_rat ring,
+ * so a run reports the kernel beside the engine's device side (measured, not derived) */
+static int cc_ra_slot(CcCtx *c) {
+    if (g_rat.on < 0) {
+        const char *e = getenv("CCG_RA_TIMING");
+        g_rat.on = e && *e && *e != '0' ? 1 : 0;
+        if (g_rat.on)
+            for (int i = 0; i < CC_RA_SLOTS; i++)
+                if (cudaEventCreate(&g_rat.a[i]) != cudaSuccess || cudaEventCreate(&g_rat.b[i]) != cudaSuccess) { g_rat.on = 0; break; }
+        (void)cudaGetLastError();
+    }
+    if (g_rat.on <= 0) return -1;
+    cc_ra_drain(c, 0);
+    for (int i = 0; i < CC_RA_SLOTS; i++) if (!g_rat.st[i]) {
+        if (cudaEventRecord(g_rat.a[i], c->stream) == cudaSuccess) { g_rat.st[i] = 1; return i; }
+        break;
+    }
+    return -1;
+}
+static void cc_ra_end(int slot, CcCtx *c) {
+    if (slot < 0) return;
+    if (cudaEventRecord(g_rat.b[slot], c->stream) == cudaSuccess) { g_rat.st[slot] = 2; g_rat.calls++; }
+    else g_rat.st[slot] = 0;
+}
 static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau, const CcRelAttn *p) {
     CcCtx *c = live();
     if (!c || !p || p->hd > 256 || p->hd < 1 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     if (p->S <= 0) return 1;
+    {   /* CCG_RA_TIMING: the kernel's own time, from here to the frame's end */
+    const int ra = cc_ra_slot(c);
     /* the decode step, GQA-shared: one block a (KV head, tile), the tile's K/V read and dequantized
      * once a KV head and every query head of it reading them (P3 of PLAN-colibri.md) */
     {
@@ -646,7 +672,7 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
                             fp(q), (const void *)fp(kc), (const void *)fp(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, part, nc);
                 coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream,
                             (const float *)part, fp(tau), fpw(o), *p, nc);
-                return launched(c, "relattn gqa");
+                { cc_ra_end(ra, c); return launched(c, "relattn gqa"); }
             }
             (void)cudaGetLastError();
         }
@@ -664,7 +690,7 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
                         fp(kvs), fp(r), fp(relp), fp(tau), *p, part);
             coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream, (const float *)part, fp(tau), fpw(o), *p, nc);
             (void)cudaFreeAsync(part, c->stream);
-            return launched(c, "relattn split");
+            { cc_ra_end(ra, c); return launched(c, "relattn split"); }
         }
         (void)cudaGetLastError();
     }
@@ -690,13 +716,15 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
             case 7: on = cc_qt_launch<7>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
             default: on = cc_qt_launch<8>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
             }
-            if (on) return launched(c, "relattn qt");
+            if (on) { cc_ra_end(ra, c); return launched(c, "relattn qt"); }
             (void)cudaGetLastError();
         }
     }
     coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), (const void *)fp(kc),
                 (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, (float *)nullptr);
+    cc_ra_end(ra, c);
     return launched(c, "relattn");
+    }
 }
 static int cc_ink2_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2Mix *p) {
     CcCtx *c = live();

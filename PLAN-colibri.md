@@ -208,7 +208,11 @@ instruction-following for this harness is. What to try next, in order:
 
 1. a correct chat/thinking prelude for this checkpoint (the template in `c/inkling.c` may be
    missing the model's `thinking` system block or the right effort string);
-2. a less quantized snapshot (Q4_K_M is on disk) to separate quantization from prompting;
+2. ~~a less quantized snapshot (Q4_K_M is on disk) to separate quantization from prompting;~~
+   **tried: Q4_K_M fails exactly the same way** (1K/2K/4K/8K, the answer is unrelated prose in
+   mixed scripts; `bench/needle_check.py --sizes 1,2,4,8` with `NEEDLE_SNAP=.../q4km.colibri`,
+   log `/var/tmp/scratch/kvtest/needle-q4km.log`). Quantization is ruled out; the harness is the
+   prompt/template, not the KV path;
 3. an oracle-based check that does not need instruction-following: teacher-forced argmax of a
    natural 32K/128K continuation, f32 vs q4 (`INK_TF_DUMP`), with a tokenizer dump added to
    the engine (a `INK_IDS_DUMP` knob) so the reference ids are the real ones.
@@ -481,6 +485,19 @@ Same prompt and box as §2.1, `INK2_KV=q4`, CUDA, `OMP_NUM_THREADS=6`, 32 tokens
 
 The 250K run of §5 is repeated with these kernels in §14.9.
 
+**Where the device side actually goes** (`CCG_RA_TIMING=1`: CUDA events around the attention
+kernels only, so this is measured rather than derived). 64K:
+
+| 64K device side 70.7 s | s | share |
+|---|---:|---:|
+| attention kernels | **48.1** (4512 calls, 10.7 ms a call) | 68% |
+| projections, norms, clips, dconv, gate | 22.6 | 32% |
+
+The kernels do 233.1 TFLOP (201.2 global + 31.9 ring) in those 48.1 s = **4.85 TFLOP/s**, i.e.
+the engine runs the kernel at the microbench's rate; the 23% "gap" between 3.85 and 5.0 TFLOP/s
+was never the kernel. Scaled to the 250K run that is ~566 s of kernel beside ~266 s of other
+device work — which caps what a tensor-core kernel can win and gives the 266 s a name.
+
 ### 14.9 250K with the new kernels
 
 Same command and model as §5 (`CTX_MAX=262144`, `INK2_KV=q4`, 24 tokens), on the rebuilt
@@ -514,11 +531,12 @@ Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-n
 
 ### 14.10 What is still open
 
-- **The tensor-core prompt path (P1.2)** was not written. The gate it needed is now measured:
-  f16 is range-safe for this checkpoint (§14.1). With the fp32 kernel at 5.0 TFLOP/s, the
-  case for hand-written `mma` is weaker than when the plan was written (it was at 1.0), and it
-  must still pass the same CPU-reference and oracle gates. The structural wins above were
-  cheaper and are in.
+- **The tensor-core prompt path (P1.2)** was not written. The gate it needed is measured: f16
+  is range-safe (§14.1) and the kernel/other split is now measured too (§14.8): at 250K the
+  kernel is ~566 s and the other device work ~266 s, so a 2.5× kernel wins ~340 s and no more.
+  A naive `mma` port would leave the q4 dequant (≈1280 instructions a position per KV head
+  against 768 FMAs) as the limiter; it only pays with a vectorized unpack in the same change.
+  It must still pass the CPU-reference and oracle gates.
 - **P4** waits on a `cc_moe` IQ2_S path.
 - **P5** waits on a vectorized block packer (~62 s at 250K).
 - **§6's needle** is still the gate on any retrieval claim at 250K.

@@ -18,7 +18,7 @@ import tempfile
 
 CODE = "7X4Q-ALPHA-93"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SNAP = "/run/media/nazar/Gaaaymes/models/Inkling-2-Mini-GGUF/iq3xxs.colibri"
+SNAP = os.environ.get("NEEDLE_SNAP", "/run/media/nazar/Gaaaymes/models/Inkling-2-Mini-GGUF/iq3xxs.colibri")
 SUBJECTS = ["the archive team", "the night shift", "the survey crew", "the review board", "the lab staff", "the records clerk"]
 PREDS = ["checked the sensor logs", "filed the weekly report", "walked the perimeter", "tested the backup pump", "sorted the sample trays", "updated the duty roster"]
 TAILS = ["before the storm arrived", "while the generator was running", "after the long meeting", "as the sun came up", "without any delay", "for the third time that week"]

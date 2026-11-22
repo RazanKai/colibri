@@ -3101,7 +3101,30 @@ static int cc_moe_stage_op(CcBuf *b, size_t slot_bytes, int slots) {
     if (!c || (b && (b->kind != CC_DEV || slots < 1 || CC_MOE_STAGE_MAP + (size_t)slots * slot_bytes > b->bytes))) return 0;
     return coli_cuda_moe_stage(c->device, b ? (void *)b->d : nullptr, b ? slot_bytes : 0, b ? slots : 0);
 }
-static void cc_stats(CcStats *st) { if (st) *st = g_st; }
+/* The attention kernels' stream time (CCG_RA_TIMING=1): a ring of event pairs around
+ * cc_relattn's launches, drained without a wait (a slot whose end has not landed yet is left
+ * for the next drain), so a run reports how much of the device side is the kernel. */
+#define CC_RA_SLOTS 8
+static struct { cudaEvent_t a[CC_RA_SLOTS], b[CC_RA_SLOTS]; unsigned char st[CC_RA_SLOTS];
+                double ms; unsigned long long calls; int on; } g_rat = { .on = -1 };
+static void cc_ra_drain(CcCtx *c, int all) {
+    if (g_rat.on <= 0) return;
+    if (all && c && !c->lost) (void)cudaStreamSynchronize(c->stream);
+    for (int i = 0; i < CC_RA_SLOTS; i++) {
+        if (g_rat.st[i] != 2) continue;
+        if (!all && cudaEventQuery(g_rat.b[i]) != cudaSuccess) continue;
+        float ms = 0.f;
+        if (cudaEventElapsedTime(&ms, g_rat.a[i], g_rat.b[i]) == cudaSuccess) g_rat.ms += ms;
+        g_rat.st[i] = 0;
+    }
+    (void)cudaGetLastError();
+}
+static void cc_stats(CcStats *st) {
+    if (!st) return;
+    if (g_rat.on > 0) cc_ra_drain(live(), 1);
+    *st = g_st;
+    st->ra_ms = g_rat.ms; st->ra_calls = g_rat.calls;
+}
 
 /* ---- staging: copies from page-locked host memory beside the frame ---------------- */
 static int cc_copy_stream(CcCtx *c) {

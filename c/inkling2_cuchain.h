@@ -944,6 +944,10 @@ static void ink2cc_report(Model *m) {
     if (getenv("INK2CC_PROF") && *getenv("INK2CC_PROF") && *getenv("INK2CC_PROF") != '0')
         fprintf(stderr, "[CUDA] inkling2 host: %.1f s quantizing the step's rows into the %s cache, %.1f s of routed experts\n",
                 g_kv_down_s, ink_kv_name(m->kv_type), ch->host_ms / 1e3);
+    if (st.ra_calls)
+        fprintf(stderr, "[CUDA] inkling2 attention kernels: %.1f s over %llu calls (%.2f ms a call) "
+                        "[CCG_RA_TIMING; the engine's attn phase also holds the projections, norms, dconv and gate]\n",
+                st.ra_ms / 1e3, st.ra_calls, st.ra_ms / (double)st.ra_calls);
     if (ink2cc_ra_stats()) {
         const char *nm[3] = {"ring", "global", "decode"};
         fprintf(stderr, "[CUDA] inkling2 attention:");
