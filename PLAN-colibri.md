@@ -363,6 +363,10 @@ in-frame MoE path far more than today's 0–1 layers, so correctness risk goes u
 tier is not capacity-bound (§15.1), so a flat 64K result does not kill the idea; 250K is where it
 should pay.
 
+**The gate**: `bench/gate.sh` runs `cuda-inkc-check` and the needle (1K/2K/4K/8K, the served KV
+type) in one command. Every commit on the chain/mirror/tier path goes through it — the typed-mirror
+bug passed every kernel test and every speed number and still produced garbage.
+
 **The knob already exists**: `COLI_VK_TIER_WHOLE=n` (vk_tier.c) queues the n hottest layers whole
 before the per-expert heat order, default 0. So this is a measurement, not a build. The A/B to run
 is 64K at `n=17` against `n=0`, at the same recorded budget, and then one 250K at `n=13`.
@@ -391,10 +395,12 @@ at 250K, 24 heads, 8 rows = 734 ms and 16 rows = **696 ms (1.05×)**; at 64 synt
 overflows the 96 KiB tile and the dispatch falls back to the scalar kernel (20.5 s vs 1.77 s), so
 16 is only for a group ≤ 4. Default stays 8 — the 5% is inside the run-to-run spread.
 
-**MTP.** Blocked on the snapshot: the import used `--no-mtp`, and a fresh import of
+**MTP — dropped from this plan.** The import used `--no-mtp`, and a fresh import of
 `Inkling-2-Mini-UD-IQ3_XXS.gguf` finds no MTP tensors either. The DSpark drafter exists only as a
-separate GGUF (`dspark-Inkling-2-Mini-Q8_0.gguf`) for llama.cpp's speculative path, not as the
-engine's MTP head. Speculative decoding in this engine needs a snapshot that carries the head.
+separate GGUF (`dspark-Inkling-2-Mini-Q8_0.gguf`) for llama.cpp's speculative path, not as this
+engine's MTP head, and even with a head the MoE verify step costs more per accepted token than a
+plain step (it activates the union of the drafts' experts). It is not an open item: it needs a
+snapshot that ships the head, and it is not on the 250K speed path until one exists.
 
 ## 15. The typed-mirror upload bug (the real reason the output was garbage)
 
