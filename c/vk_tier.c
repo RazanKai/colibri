@@ -1059,8 +1059,20 @@ static int stream_min_rows(void) {
     }
     return r;
 }
+/* COLI_VK_TIER_STEP: a cap on the rows a streamed step hands the tier, when a prompt chunk is
+ * larger. Inkling-2's attention wants a big chunk (chunk 2048 is 1.12x at 64K) while the tier
+ * wants small steps (a 2048-row step is 16384 activated rows through 64 staging slots: at 250K it
+ * thrashed, 12 stream lines in 42 min against 735 in 26). The caller loops over slices, so a cap
+ * gives both. 0 (default): the chunk, as before. */
+static int vkt_step_cap(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("COLI_VK_TIER_STEP"); n = e && *e ? atoi(e) : 0; }
+    return n < 0 ? 0 : n;
+}
 int vkt_step_rows(int S, int block) {
-    if (T.on && T.st_ok && S >= T.gemm_rows) return S;
+    int cap = vkt_step_cap();
+    if (T.on && T.st_ok && S >= T.gemm_rows) return cap > 0 && S > cap ? cap : S;
+    if (cap > 0 && S > cap) S = cap;
     return S < block ? S : block;
 }
 

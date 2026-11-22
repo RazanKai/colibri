@@ -16,6 +16,7 @@ import subprocess
 
 PHASES = re.compile(r"\[phases\] fill (?P<fill>[0-9.]+)s \| expert-mm (?P<expert>[0-9.]+)s \| "
                     r"shared (?P<shared>[0-9.]+)s \| attn (?P<attn>[0-9.]+)s \| other (?P<other>[0-9.]+)s")
+BUDGET = re.compile(r"tier inkling: on, .*budget (?P<gib>[0-9.]+) GiB = (?P<n>[0-9]+) experts")
 PREFILL = re.compile(r"\[prefill (?P<s>[0-9.]+)s \| (?P<gen>[0-9]+) tokens in (?P<ds>[0-9.]+)s = (?P<tps>[0-9.]+) tok/s")
 TUNE = re.compile(r"TUNE decode: (?P<n>[0-9]+) tokens in (?P<s>[0-9.]+)s")
 
@@ -25,6 +26,12 @@ CELLS = [
     ("chunk 4096", {"COLI_CUDA_CHAIN_ROWS": "4096"}),
     ("chunk 1024, f16 kv", {"COLI_CUDA_CHAIN_ROWS": "", "INK2_KV": "f16"}),
     ("chunk 1024, q4, no store", {"COLI_CUDA_CHAIN_ROWS": "", "COLI_PREFIX_STORE": "0"}),
+    # the tier's budget is free VRAM minus the chain's plan, so an A/B on the expert phase has to
+    # pin it. CUDA_RESERVE_GB is inert here (measured: 2.0 vs 1.0 both gave 7.46 GiB) --
+    # CUDA_EXPERT_GB is the dial that lands exactly (7.5 -> 7.49 GiB, 2302 experts).
+    ("expert 7.5 GB", {"CUDA_EXPERT_GB": "7.5"}),
+    ("expert 6.5 GB", {"CUDA_EXPERT_GB": "6.5"}),
+    ("chunk 1024 + expert 7.5", {"CUDA_EXPERT_GB": "7.5", "COLI_CUDA_CHAIN_ROWS": ""}),
 ]
 
 
@@ -39,7 +46,7 @@ def run(binary, snap, prompt, n, env, timeout):
     out = subprocess.run([binary, "-f", prompt, "-n", str(n)], capture_output=True, text=True,
                          env=e, timeout=timeout)
     row = {"env": env, "provenance": "measured"}
-    for name, rx in (("phases", PHASES), ("prefill", PREFILL), ("tune", TUNE)):
+    for name, rx in (("phases", PHASES), ("prefill", PREFILL), ("tune", TUNE), ("budget", BUDGET)):
         for line in out.stdout.splitlines():
             m = rx.search(line)
             if m:
@@ -65,9 +72,10 @@ def main():
         r["cell"] = name
         rows.append(r)
         p = r.get("phases", {})
-        print("%-24s prefill %-8s attn %-7s expert %-7s other %-7s %s" % (
+        b = r.get("budget", {})
+        print("%-24s prefill %-8s attn %-7s expert %-7s other %-7s tier %s/%s %s" % (
             name, r.get("prefill", {}).get("s", "?"), p.get("attn", "?"), p.get("expert", "?"),
-            p.get("other", "?"), r.get("error", "")), flush=True)
+            p.get("other", "?"), b.get("gib", "?"), b.get("n", "?"), r.get("error", "")), flush=True)
     with open(a.out, "w") as f:
         json.dump(rows, f, indent=1)
     print("sweep_engine: %d cells -> %s" % (len(rows), a.out))

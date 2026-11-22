@@ -353,26 +353,26 @@ __global__ static void ccg_relattn_dec_k(const float *__restrict__ q, const void
  * serial 128-long chain. The online softmax, the sink, tau, the relative bias, the window and
  * the ring, and the split between the mirror and kvs's own rows, are the scalar kernel's. */
 #define CCG_QT 8
-#define CCG_TP 32
+#define CCG_TP 32   /* positions a tile: one lane a position, so the score loop wants 32 exactly */
 /* One instantiation a G (the query heads of a KV head, 1..8): the head loop unrolls with a
  * constant bound, so the accumulators stay in registers and a G of 3 does not pay for 8. */
 template <int G>
 __global__ static void ccg_relattn_qt_t(const float *__restrict__ q, const void *__restrict__ kc,
                                         const void *__restrict__ vc, float *__restrict__ o, const float *__restrict__ kvs,
                                         const float *__restrict__ r, const float *__restrict__ relp,
-                                        const float *__restrict__ tau, CcRelAttn p) {
-    const int kvh = (int)blockIdx.x, tb0 = (int)blockIdx.y * CCG_QT, tid = (int)threadIdx.x;
+                                        const float *__restrict__ tau, CcRelAttn p, int qtq) {
+    const int kvh = (int)blockIdx.x, tb0 = (int)blockIdx.y * qtq, tid = (int)threadIdx.x;
     const int wp = tid >> 5, lane = tid & 31, hd = p.hd, kd4 = hd >> 2;
     extern __shared__ float sm[];
     /* Q[QT][G][hd]; Kt4[d4][TP] float4, the K tile transposed on its dim chunks so a lane's
      * float4 is conflict-free (the row-major tile put all 32 lanes' float4 in the same four
      * banks); Vt[TP][hd]; P[G][TP]. */
-    float *Q = sm, *Kt4 = Q + (size_t)CCG_QT * G * hd, *Vt = Kt4 + (size_t)kd4 * CCG_TP * 4,
+    float *Q = sm, *Kt4 = Q + (size_t)qtq * G * hd, *Vt = Kt4 + (size_t)kd4 * CCG_TP * 4,
           *P = Vt + (size_t)CCG_TP * hd;
     __shared__ int t_first, t_last;
     if (tid == 0) {
         int lo = 0x7fffffff, hi = -1;
-        for (int i = 0; i < CCG_QT; i++) {
+        for (int i = 0; i < qtq; i++) {
             const int s2 = tb0 + i;
             if (s2 >= p.S) continue;
             const int qp = p.pos_base + s2, t0 = p.window > 0 ? max(0, qp - p.window + 1) : 0;
@@ -381,7 +381,7 @@ __global__ static void ccg_relattn_qt_t(const float *__restrict__ q, const void 
         }
         t_first = lo; t_last = hi;
     }
-    for (int idx = tid; idx < CCG_QT * G * hd; idx += (int)blockDim.x) {
+    for (int idx = tid; idx < qtq * G * hd; idx += (int)blockDim.x) {
         const int rr = idx / (G * hd), rest = idx - rr * G * hd, h = rest / hd, d = rest - h * hd;
         const int s2 = tb0 + rr;
         Q[idx] = s2 < p.S ? q[p.q_off + (long)s2 * p.q_row + (long)(kvh * G + h) * hd + d] : 0.f;
@@ -597,14 +597,27 @@ static int cc_sconv(CcBuf *x, CcBuf *w, CcBuf *ring, const CcSconv *p) {
 template <int G>
 static int cc_qt_launch(const float *q, const void *kc, const void *vc, float *o, const float *kvs,
                         const float *r, const float *relp, const float *tau, const CcRelAttn &p,
-                        dim3 g, size_t sm, cudaStream_t st) {
+                        dim3 g, int nthr, size_t sm, cudaStream_t st) {
     static int attr = -1;
     if (attr < 0)
         attr = cudaFuncSetAttribute(ccg_relattn_qt_t<G>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     96 * 1024) == cudaSuccess ? 1 : 0;
     if (!attr) return 0;
-    coli_launch(ccg_relattn_qt_t<G>, g, 256, sm, st, q, kc, vc, o, kvs, r, relp, tau, p);
+    coli_launch(ccg_relattn_qt_t<G>, g, nthr, sm, st, q, kc, vc, o, kvs, r, relp, tau, p, nthr / 32);
     return 1;
+}
+/* the prompt tile's query rows (COLI_CUDA_RELATTN_ROWS, default CCG_QT, 1..32): one warp a row, so
+ * 16 means 512 threads and half the blocks over the same K/V -- every tile is dequantized and read
+ * once for twice the rows. A tile still covers CCG_TP positions (one lane a position). */
+static int cc_relattn_rows(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("COLI_CUDA_RELATTN_ROWS");
+        n = e && *e ? atoi(e) : CCG_QT;
+        if (n < 1) n = 1;
+        if (n > 32) n = 32;
+    }
+    return n;
 }
 /* COLI_CUDA_RELATTN_GQA=0: the decode step's old walk (a block a (query head, row), the same rows
  * read and dequantized G times) */
@@ -700,21 +713,23 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
         const char *e = getenv("COLI_CUDA_RELATTN_QT");
         const int G = p->H / p->KVH;
         const int want = e && *e ? atoi(e) : CCG_QT;
-        const size_t sm = ((size_t)CCG_QT * G * p->hd + (size_t)CCG_TP * (p->hd + 4) +
-                           (size_t)CCG_TP * p->hd + (size_t)CCG_QT * G * CCG_TP) * sizeof(float);
+        const int qtq = cc_relattn_rows();
+        const size_t sm = ((size_t)qtq * G * p->hd + (size_t)CCG_TP * (p->hd + 4) +
+                           (size_t)CCG_TP * p->hd + (size_t)qtq * G * CCG_TP) * sizeof(float);
         if (p->S >= want && want > 1 && G >= 1 && G <= 8 && p->hd <= 128 && (p->hd & 3) == 0 &&
-            sm <= 96 * 1024 && p->kv_type >= 0 && p->kv_type <= 3) {
-            const dim3 g((unsigned)p->KVH, (unsigned)((p->S + CCG_QT - 1) / CCG_QT));
+            sm <= 96 * 1024 && qtq * 32 <= 1024 && p->kv_type >= 0 && p->kv_type <= 3) {
+            const dim3 g((unsigned)p->KVH, (unsigned)((p->S + qtq - 1) / qtq));
+            const int nthr = qtq * 32;
             int on = 0;
             switch (G) {
-            case 1: on = cc_qt_launch<1>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
-            case 2: on = cc_qt_launch<2>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
-            case 3: on = cc_qt_launch<3>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
-            case 4: on = cc_qt_launch<4>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
-            case 5: on = cc_qt_launch<5>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
-            case 6: on = cc_qt_launch<6>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
-            case 7: on = cc_qt_launch<7>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
-            default: on = cc_qt_launch<8>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            case 1: on = cc_qt_launch<1>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
+            case 2: on = cc_qt_launch<2>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
+            case 3: on = cc_qt_launch<3>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
+            case 4: on = cc_qt_launch<4>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
+            case 5: on = cc_qt_launch<5>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
+            case 6: on = cc_qt_launch<6>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
+            case 7: on = cc_qt_launch<7>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
+            default: on = cc_qt_launch<8>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, nthr, sm, c->stream); break;
             }
             if (on) { cc_ra_end(ra, c); return launched(c, "relattn qt"); }
             (void)cudaGetLastError();

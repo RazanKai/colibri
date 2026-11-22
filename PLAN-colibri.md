@@ -327,6 +327,31 @@ A full q4 device mirror (9.2 GB) plus the 8 GiB tier does not fit 12 GB. Options
 - **M3** — 1M acceptance or documented 24 GB requirement. *Open.*
 - **M4** — Upstream the KV type and the tiled kernel behind env flags with docs/tests. *Open.*
 
+## 15.1 The remaining plan items: what each attempt measured
+
+**Tier budget determinism (step 2, cheap half).** `CUDA_RESERVE_GB` is **inert** in this engine:
+2.0 and 1.0 both produced 7.46 GiB (2294 vs 2297 experts) and prefill 258.1 vs 260.5 s. The dial
+that lands exactly is `CUDA_EXPERT_GB`: `=7.5` gave 7.49 GiB / 2302 experts, prefill 257.1 s
+(expert 130.7 s). So an expert A/B must pin `CUDA_EXPERT_GB` and compare at the same value; the
+run-to-run budget drift (5.46 → 5.91 → 7.68 GiB) is free VRAM at start, not a knob.
+
+**Chunk 2048 at 250K: negative, and for a nameable reason.** With `COLI_CUDA_CHAIN_ROWS=2048` the
+250K run made the tier's expert step 16384 activated rows: 12 `tier ... stream` lines in 42 min
+against 735 in 26 min for chunk 1024, i.e. roughly 6× slower (killed). The same mechanism is the
+8K/4096 cliff. So chunk 2048 is a 64K setting (1.12×) and 1024 stays the 250K setting; a new
+`COLI_VK_TIER_STEP` caps the streamed step for anyone who wants the big attention chunk with small
+expert steps (off by default), but at 64K the win *was* the bigger step, so it is not a free lunch.
+
+**Query rows a block (QT).** `CCG_QT` is now runtime (`COLI_CUDA_RELATTN_ROWS`, one warp a row):
+at 250K, 24 heads, 8 rows = 734 ms and 16 rows = **696 ms (1.05×)**; at 64 synthetic heads 16 rows
+overflows the 96 KiB tile and the dispatch falls back to the scalar kernel (20.5 s vs 1.77 s), so
+16 is only for a group ≤ 4. Default stays 8 — the 5% is inside the run-to-run spread.
+
+**MTP.** Blocked on the snapshot: the import used `--no-mtp`, and a fresh import of
+`Inkling-2-Mini-UD-IQ3_XXS.gguf` finds no MTP tensors either. The DSpark drafter exists only as a
+separate GGUF (`dspark-Inkling-2-Mini-Q8_0.gguf`) for llama.cpp's speculative path, not as the
+engine's MTP head. Speculative decoding in this engine needs a snapshot that carries the head.
+
 ## 15. The typed-mirror upload bug (the real reason the output was garbage)
 
 **Symptom.** With `INK2_KV=q4` (or f16/q8) on the CUDA chain, the engine completed a 250K
