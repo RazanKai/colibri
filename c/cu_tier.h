@@ -39,6 +39,7 @@ int  cut_ram_first(int layer, int eid);
 void cut_ram_gave(void);
 unsigned cut_epoch(void);
 int  cut_dev_table(int layer, uint32_t *entries);
+int  cut_whole_span(int *start, int *count);
 void cut_dev_count(int layer, int S, int K, const int *idx);
 void cut_settle(void);
 int  cut_dev_changes(unsigned since, int *slots, int max);
@@ -87,6 +88,7 @@ static inline int  cut_ram_first(int l,int e){(void)l;(void)e;return 0;}
 static inline void cut_ram_gave(void){}
 static inline unsigned cut_epoch(void){return 0;}
 static inline int  cut_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
+static inline int  cut_whole_span(int *s,int *c){(void)s;(void)c;return 0;}
 static inline void cut_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 static inline void cut_settle(void){}
 #endif

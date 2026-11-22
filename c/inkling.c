@@ -2844,23 +2844,37 @@ static size_t ink_kv_later(const Model *m) {
 static size_t ink_ps_plan(void);   /* the prefix store's budget (prefix_store.h), planned with the RAM */
 /* The warm start on the tier XT names: the hottest experts of the history first (vkt_plan),
  * read from disk in parallel, each handed over and released. */
+static void ink_tier_warm_one(Model *m, int layer, int eid) {
+    Slot tmp;
+    if (ink_vk_tmp_slot(m, &tmp, eid)) {
+        slot_fill(m, layer, &tmp);
+        VktExpertSrc src = ink_vk_slot_src(m, layer, &tmp);
+        XT(put)(layer, eid, &src);
+    } else XT(put)(layer, eid, NULL);   /* no memory: the planned slot is released */
+    ink_vk_tmp_free(&tmp);
+}
 static void ink_tier_warm(Model *m, const char *engine) {
     const Cfg *c = &m->c;
     int all = c->n_layers * c->n_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
     const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
     int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
+    int ws = 0, wn = 0;   /* COLI_VK_TIER_WHOLE: its span, uploaded first and in this order */
+    if (n > 0) XT(whole_span)(&ws, &wn);
+    if (ws < 0 || wn < 0 || ws + wn > n) { ws = 0; wn = 0; }
+    if (n > 0 && getenv("INK2CC_DM_DEBUG"))
+        fprintf(stderr, "[warmdbg] plan %d, whole span %d + %d\n", n, ws, wn);
     if (n > 0) {
         double t0 = now_s();
+        /* A whole layer needs all E of its experts resident. The parallel fill below would
+         * queue them out of order and let the per-expert heat entries take their room, so the
+         * planned layers came out 104-125 of 128 (measured: 0 of 24 in the frame at n=12).
+         * Upload the span sequentially first; the rest still fills in parallel. */
+        for (int i = ws; i < ws + wn; i++) ink_tier_warm_one(m, pl[i], pe[i]);
         #pragma omp parallel for schedule(dynamic, 4)
         for (int i = 0; i < n; i++) {
-            Slot tmp;
-            if (ink_vk_tmp_slot(m, &tmp, pe[i])) {
-                slot_fill(m, pl[i], &tmp);
-                VktExpertSrc src = ink_vk_slot_src(m, pl[i], &tmp);
-                XT(put)(pl[i], pe[i], &src);
-            } else XT(put)(pl[i], pe[i], NULL);   /* no memory: the planned slot is released */
-            ink_vk_tmp_free(&tmp);
+            if (i >= ws && i < ws + wn) continue;
+            ink_tier_warm_one(m, pl[i], pe[i]);
         }
         XT(put_done)();
         XT(warm_report)(engine, n, now_s() - t0);

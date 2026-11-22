@@ -260,6 +260,9 @@ int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
 void vkt_shutdown(void);
 int  vkt_plan(int *layers, int *eids, int max);
+/* The last vkt_plan's whole-layer span [*start, *start + *count): upload it before the rest,
+ * in this order, or the parallel warm start scatters it and no layer is whole. */
+int  vkt_whole_span(int *start, int *count);
 /* The warm start's line ("[VK] tier <engine>: warm start, N experts in Xs (...)"): what
  * came from the history and what filled the rest of the device (vkt_plan). */
 void vkt_warm_report(const char *engine, int n, double seconds);
@@ -403,6 +406,7 @@ static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(voi
 static inline int  vkt_ready(void){return 0;}
 static inline void vkt_shutdown(void){}
 static inline int  vkt_plan(int *l,int *e,int m){(void)l;(void)e;(void)m;return 0;}
+static inline int  vkt_whole_span(int *s,int *c){(void)s;(void)c;return 0;}
 static inline void vkt_warm_report(const char *e,int n,double s){(void)e;(void)n;(void)s;}
 static inline int  vkt_put(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;return 0;}
 static inline void vkt_put_done(void){}

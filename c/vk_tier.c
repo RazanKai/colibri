@@ -197,6 +197,7 @@ static struct {
     unsigned long long f_pool, f_copy, f_sets;
     unsigned long long gave_up;          /* uploads given up for a give-back (#2705): back on the CPU, not failed */
     int plan_hist;                        /* the last plan's experts from the history (vkt_plan) */
+    int whole_start, whole_n;              /* the whole-layer span of the last plan (vkt_whole_span) */
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -909,7 +910,7 @@ static uint32_t *const *g_heat_hist;
  * does not starts with the device full, and the promotions trade cold residents for
  * hot ones as before. */
 int vkt_plan(int *layers, int *eids, int max) {
-    T.plan_hist = 0;
+    T.plan_hist = 0; T.whole_start = T.whole_n = 0;
     if (!T.on) return 0;
     int L = T.main_layers, E = T.c.experts, n = 0, k = 0;   /* the main layers' */
     /* the extra layers' experts first where they stay whole (extra_whole): their own pool,
@@ -961,6 +962,9 @@ int vkt_plan(int *layers, int *eids, int max) {
             }
         }
     }
+    /* the span the warm start uploads first, in this order, so a layer is whole on the device
+     * before the per-expert order fills the rest of the pool (parallel vkt_put would scatter it) */
+    T.whole_start = kx; T.whole_n = k - kx;
     if (g_heat_hist) {
         int *order = malloc((size_t)L * E * sizeof(int));
         if (!order) return 0;
@@ -992,6 +996,11 @@ int vkt_plan(int *layers, int *eids, int max) {
             layers[k] = l; eids[k] = e; k++;
         }
     return k;
+}
+int vkt_whole_span(int *start, int *count) {
+    if (start) *start = T.whole_start;
+    if (count) *count = T.whole_n;
+    return T.whole_n;
 }
 /* The warm start's line, for every engine: "warm start, N experts" stays its head. */
 void vkt_warm_report(const char *engine, int n, double seconds) {

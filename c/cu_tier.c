@@ -122,6 +122,7 @@ static const CuTierOps *cut_ops(void) {
 #define vkt_layers cut_layers
 #define vkt_note cut_note
 #define vkt_plan cut_plan
+#define vkt_whole_span cut_whole_span
 #define vkt_put cut_put
 #define vkt_put_done cut_put_done
 #define vkt_ram_first cut_ram_first
