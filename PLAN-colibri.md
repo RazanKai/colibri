@@ -660,6 +660,20 @@ our no-drafter path already leads llama.cpp's drafter-assisted one at 64K. The p
 is established **only up to 64K**: there is no llama.cpp 250K decode cell, so "decode work
 dropped" is not yet a 250K claim (the engine's 250K decode is 12.22 tok/s, uncompared).
 
+## 15.7 Needle depth and a second fact type (250K-class)
+
+A single pass at ~96% is one fact at one depth. `bench/needle_depth.py` puts three facts of two
+kinds in one prompt — vault code at 10%, pump serial at 50%, cipher key at 90% — and asks for all
+three. At **244,180 tokens** (q4, CUDA chain, 64 tokens) the generation is verbatim
+`7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27.` — **3 of 3**, so retrieval is not a lucky
+end-of-context pattern. The same prompt at 8K is also 3 of 3.
+
+A caution from the first attempt: a 272,517-token prompt with `CTX_MAX=262144` did not error; the
+engine prefilled it and answered only `7X4Q` (0 of 3 in the check), i.e. a prompt past `CTX_MAX`
+silently loses the far facts. Keep the prompt under the limit, or make the harness refuse it
+(the harness now targets 244K). The 250K headline stays the 250,156-token single-code run of §15;
+this cell adds depth and type coverage at 244K.
+
 ## Appendix — benchmark commands
 
 ```bash
