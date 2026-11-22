@@ -2,9 +2,11 @@
 
 Status: **Stage 1 implemented and measured** (f16/q8/q4 host KV, typed CUDA mirror, tiled
 prefill attention). 64K now beats the Unsloth b12588 baseline on prefill; 250K loads, prefill
-completes and decode runs. The 250K needle test is **not passing yet**: the same harness fails
-at 943 tokens, so the blocker is the model/prompt, not the KV or the context path (evidence in
-§6).
+completes and decode runs. The 250K needle failed until §15: it was **our bug**, not the
+model — with a typed KV cache the CUDA chain never uploaded the prompt's rows to the device
+mirror, so everything after the first 1K chunk attended to zeros. Fixed (mark the rows in
+`ink2cc_kv_down`); the harness now retrieves the code at 1K/2K/4K/8K on the CUDA q4 path, and
+llama.cpp and this engine's CPU path always did.
 **250K/262K speed pass (P0–P6, §14):** the attention kernels were rebuilt (GQA-shared decode,
 K-tile transpose, one tile read per query head, exp2). 64K: prefill 387.1 → 266.6 s (1.45×),
 device side 202.6 → 69.5 s (2.91×), decode 14.94 → 16.55 tok/s. 250K: prefill **3651.5 →
@@ -190,7 +192,17 @@ SNAP=.../iq3xxs.colibri CTX_MAX=262144 INK2_KV=q4 COLI_CUDA=1 OMP_NUM_THREADS=6 
 - Attention scales as expected from 64K (202.6 s × (250/64)² ≈ 3090 s), so the long-context
   path is behaving; the cost is plain O(S²) fp32 attention.
 
-## 6. The 250K needle: not passing, with a concrete blocker
+## 6. The 250K needle
+
+**Resolved (§15): this was never the model.** The failure below is the typed-mirror upload bug:
+with `INK2_KV` f16/q8/q4 the CUDA chain filled the host cache but never marked the rows for the
+device mirror, so every chunk after the first and every decode step attended to zeros. The same
+prompt and snapshot answer correctly with `COLI_CUDA=0`, with `COLI_CUDA_CHAIN=0`, with
+`INK2_KV=f32`, and in Unsloth's llama.cpp — and now with the fix, at 1K/2K/4K/8K. The analysis
+that follows is kept because it is how the bug was found (and because it is the record of a wrong
+diagnosis: quantization and prompting were both blamed and both were innocent).
+
+### The original (mis)diagnosis
 
 The prompt is 1.15 MB of natural-ish prose with the fact
 `The secret access code for the vault is 7X4Q-ALPHA-93` at ~240K tokens and the question at
@@ -313,6 +325,53 @@ A full q4 device mirror (9.2 GB) plus the 8 GiB tier does not fit 12 GB. Options
   439.8 s; decode 14.94 vs 18.33 tok/s.*
 - **M3** — 1M acceptance or documented 24 GB requirement. *Open.*
 - **M4** — Upstream the KV type and the tiled kernel behind env flags with docs/tests. *Open.*
+
+## 15. The typed-mirror upload bug (the real reason the output was garbage)
+
+**Symptom.** With `INK2_KV=q4` (or f16/q8) on the CUDA chain, the engine completed a 250K
+prefill and decoded, but the text was unrelated prose in mixed scripts. The needle failed at
+943 tokens — before any context-length effect could exist.
+
+**How it was isolated** (each step is a real run, in order):
+
+| configuration | needle at ~1K | verdict |
+|---|---|---|
+| Unsloth llama.cpp, same GGUF, raw completion, temp 0 | **`7X4Q-ALPHA-93`** | the snapshot is fine |
+| this engine, `COLI_CUDA=0` (host path) | **`7X4Q-ALPHA-93`** | loader, tokenizer, RoPE, loop, norms, host attention all fine |
+| this engine, CUDA, `COLI_CUDA_CHAIN=0` (per-matrix) | **`7X4Q-ALPHA-93`** | the CUDA per-matrix path is fine |
+| this engine, CUDA chain, `INK2_KV=f32` | **`7X4Q-ALPHA-93`** | the chain is fine when it fills its mirror |
+| this engine, CUDA chain, `INK2_KV=f16` | garbage | typed cache only |
+| this engine, CUDA chain, `INK2_KV=q4` | garbage | typed cache only |
+| this engine, CUDA chain, q4, `COLI_CUDA_CHAIN_MOE=0` | garbage | not the in-frame MoE |
+
+`bench/ab_needle.py` runs the first and last rows; `bench/ab_tokens.py` compared the tokenizer
+and found **808 vs 808 ids, identical**, so the prompt bytes were never the problem.
+
+**The bug.** `ink2cc_attention` fills the mirror inside the layer for f32
+(`cc_copy_regions(ch->kc[v], ch->kvs, ...)`). For a typed cache that copy is skipped — the rows
+are quantized on the host by `ink2cc_kv_down` and are supposed to be uploaded by the next
+`push_state`. But nothing ever marked the rows for upload (`ch->dlo/dhi` are only touched by
+`ink2cc_cpu_step`, i.e. on a host fallback), so `push_state` had nothing to send. Result: the
+first 1K-token chunk (whose rows are read from `kvs`) prefills correctly, and everything after
+it — the rest of a long prompt, and every decode step — attends to a zero mirror. That is
+exactly the symptom: fluent local continuation, total loss of anything from the context.
+
+**The fix** (in `ink2cc_kv_down`): mark `[pb, pb+n)` for the layer after quantizing, so the next
+`push_state` uploads it. Six lines; the host-side arithmetic and the kernels are unchanged.
+
+**After the fix**, `bench/needle_check.py --kv q4 --sizes 1,2,4,8`:
+
+```
+ 1K (943 tokens):   FOUND  7X4Q-ALPHA-93
+ 2K (1855 tokens):  FOUND  7X4Q-ALPHA-93
+ 4K (3652 tokens):  FOUND  7X4Q-ALPHA-93
+ 8K (7288 tokens):  FOUND  7X4Q-ALPHA-93
+```
+
+**What this invalidates.** Every quality statement made before this fix — including §2's "250K
+loads, prefill completes and decode runs" and all of §6 — was made on a device path that had
+lost the context. The *speed* figures stand (the same work was done, on zeros), but the 250K
+"works" claim did not, and the model was wrongly blamed for a bug in this fork.
 
 ## Appendix — benchmark commands
 

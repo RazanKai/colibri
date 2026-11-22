@@ -595,7 +595,18 @@ static void ink2cc_kv_down(Ink2CuChain *ch, Model *m, int v, int n, int pb, cons
         ink_kv_put(m->kv_type, (char *)m->K[v] + row * rb, kv + src, hd);
         ink_kv_put(m->kv_type, (char *)m->V[v] + row * rb, vv + src, hd);
     }
-    (void)pb;
+    /* The rows the next push_state uploads. A typed cache has no in-frame copy -- the f32 branch
+     * of ink2cc_attention copies its rows into the mirror, the typed one only quantizes here --
+     * so without this mark the mirror never receives the prompt's rows and every later chunk and
+     * every decode step attends to zeros. (It did: the needle failed at 943 tokens on an IQ3_XXS
+     * whose host path answers it, which is how this was found.) */
+    if (m->kv_type != INK_KV_F32) {   /* the f32 branch of ink2cc_attention already filled its mirror */
+        if (ch->dlo[v] >= ch->dhi[v]) { ch->dlo[v] = pb; ch->dhi[v] = pb + n; }
+        else {
+            if (pb < ch->dlo[v]) ch->dlo[v] = pb;
+            if (pb + n > ch->dhi[v]) ch->dhi[v] = pb + n;
+        }
+    }
     g_kv_down_s += ink2cc_now() - t0;
 }
 /* the MoE output of layer i, state layer v (routed: the host's sum, or the frame's) joining the stream:
