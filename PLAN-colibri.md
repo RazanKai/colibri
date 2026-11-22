@@ -468,6 +468,18 @@ experts, 14× the 2048 cell) — so 1024/2048 is the safe band; and f16 KV costs
 attention gain (the kernel widens both types the same way), so q4 stays the long-context setting.
 The prefix store is ~free (28.1 s with it off vs 29.5 s with it on, within run noise).
 
+At **64K the chunk size does matter, and the 8K cells cannot see it**. Same binary, same tier
+budget (7.68 GiB = 2362 experts), run back to back:
+
+| 64K, 63,977 tokens | prefill | experts | attn (device) | other | decode |
+|---|---:|---:|---:|---:|---:|
+| chunk 1024 | 265.6 s | 148.1 s | 69.1 s | 45.9 s | 16.82 tok/s |
+| **chunk 2048** | **236.2 s** | 123.4 s | 73.3 s | 38.1 s | 17.21 tok/s |
+
+A 1.12× prefill win, reproduced (233.6 s and 236.2 s in two runs), and it comes from the expert
+step: half as many, twice as large, so the tier evicts and streams less. `COLI_CUDA_CHAIN_ROWS`
+is the knob (default 1024; 4096 stays off the table).
+
 ### 14.8 End to end, 64K
 
 Same prompt and box as §2.1, `INK2_KV=q4`, CUDA, `OMP_NUM_THREADS=6`, 32 tokens:
