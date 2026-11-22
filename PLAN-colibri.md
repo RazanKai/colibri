@@ -537,6 +537,107 @@ it lands near 16–17, the engine has no real decode gap and P4-style decode wor
 **Order**: the 250K needle (first result to record) → B1/B2 → n12 → break-even → the rest only if
 the two cells justify it → DSpark at 8K/64K.
 
+## 15.4 The whole-layer A/B, measured (this tree)
+
+The knob (`COLI_VK_TIER_WHOLE=n`) is a measurement, not a build, but the first sweep found that
+the plan's premise — n=12 completes the twelve loop layers — does not hold, and the reason is
+structural, not a tuning miss.
+
+**The in-frame MoE is decode-only.** `ink2cc_dmoe` returns 0 for `rows > CC_MOE_FRAME_ROWS` (=8),
+so no prompt chunk runs a layer's experts in the frame; the path is taken on decode steps (and a
+verify) only. A whole-layer win therefore cannot show in prefill at all, and the break-even's
+`c_f` never enters the 250K expert phase.
+
+**The warm start's whole layers do not survive prefill.** `bench/sweep_whole.py`, q4, 64K, 16
+tokens, one cell at a time; every row in `bench/results-whole.json` records the budget line,
+launch free VRAM, frame count, phases, prefill, decode and RSS:
+
+| cell | budget GiB = experts | free GB | layers in frame | prefill s | decode tok/s |
+|---|---:|---:|---:|---:|---:|
+| B1 n=0 | 7.47 = 2296 | 11.2 | 0/24 | 248.0 | 18.09 |
+| B2 n=0 | 7.48 = 2299 | 11.2 | 0/24 | 253.4 | 17.77 |
+| n6 | 7.49 = 2304 | 11.2 | 0/24 | 251.6 | 17.56 |
+| n12 | 7.51 = 2309 | 11.2 | 0/24 | 252.8 | 17.52 |
+| n12 (after the upload fix) | 7.47 = 2297 | 11.2 | 0/24 | 256.3 | 17.52 |
+| n13 | 7.52 = 2311 | 11.2 | 0/24 | 251.9 | 17.73 |
+| n17 | 7.52 = 2311 | 11.2 | 6/24 | 259.2 | 15.31 |
+| n17 (after the upload fix) | 7.44 = 2286 | 11.2 | 6/24 | 268.0 | 14.58 |
+
+All cells are budget-matched (max delta 0.08 GiB from B1; free VRAM 11.2 GB throughout), so the
+prefill spread is run-to-run noise. Prefill is flat for n≤13 and 2–6% worse at n=17; decode is
+flat for n≤13 and 16–19% worse at n=17. The first decode step has **0 of 24 layers whole at
+n=12**, not 12: the warm start does queue twelve loop layers whole (measured span 1536 experts;
+the parallel fill used to scatter it, hence the sequential span upload in `ink_tier_warm`), but
+prefill's promotions (16 a token, balanced against the CPU) trade those residents by heat and
+break every loop layer before the first decode step reads the table.
+
+**One 250K n=12 cell, budget-matched to the n=0 baseline.** q4, 24 tokens, same prompt: budget
+5.66 GiB = 1724 experts vs the baseline's 5.71 GiB = 1741, launch free 11.2 vs 11.3 GB (matched:
+0.05 GiB and 0.1 GB). The needle still passes (`7X4Q-ALPHA-93`, verbatim) and the answer is
+coherent. Prefill **1745.5 s** vs 1678.0 (+4.0%), decode **9.69** vs 12.22 tok/s (−20.7%), RSS
+11.3 GB, **0 of 24 layers in the frame**. The cost is in the stream counters: 132,842 cold experts
+/ 419.0 GiB / 11.43 M rows streamed vs 84,867 / 320.0 GiB / 4.50 M at n=0, because 1536 of the
+1724 resident slots are reserved whole and only 188 are left for the other twelve layers. Expert
+phase 568.6 s (was 658.1), attn 987.2 s (was 836.4).
+
+**Verdict.** Whole-layer residency is a measured negative on this tree: it does not deliver the
+planned 77% in-frame coverage (0 of 24 at decode at n=12), it cannot affect prefill at all
+(decode-only path), and it costs the prefill 4% at 250K and 2–6% at 64K while costing decode
+16–21% at n=17. The break-even is not reached because the in-frame path never gets the loop
+layers at the measured decode step. Keep per-expert residency (default 0); do not revisit the
+whole-layer policy unless the in-frame MoE path is extended to prompt chunks and the warm start's
+layers are protected from prefill's promotions. These numbers make the earlier `n=17`/`n=13` A/B
+in §15.2/§15.3 unnecessary as a policy choice — the two cells that decide it are already
+negative.
+
+The `n>0` end-to-end check is the needle: with `COLI_VK_TIER_WHOLE=12`,
+`bench/needle_check.py --kv q4 --sizes 1,2,4,8` is FOUND at all four sizes, and the 250K n=12
+run answers the code. The teacher-forced oracle is a CPU/f32 parity gate, and the tier's
+device/CPU split changes the numerics (§12), so it cannot be an exact check for a `n>0` cell —
+`bench/gate.sh` (kernel reference + needle) is the correctness gate here.
+
+## 15.5 Host overlap, and the wavefront-vs-tensor-core decision
+
+The deciding number is the fraction of the host expert step that already overlaps device work.
+
+| run | host routed experts (chain) | waited for device | device (tier) | host share in the stream window | device time hidden | host step overlapped |
+|---|---:|---:|---:|---:|---:|---:|
+| 250K n=0 | 775.3 s | 681.6 s | 289.5 s | 238.7 s | 129.2 s | **16.7%** (129.2/775.3) |
+| 64K B1 | 159.1 s | 62.8 s | 78.3 s | 17.2 s | 34.7 s | **10.8%** (17.2/159.1) |
+
+The phase line corroborates it: at 250K fill 5.3 + expert-mm 658.1 + attn 836.4 + other 180.1 =
+1679.9 s against a prefill of 1678.0 s — the `moe_ex` bulk is additive, not hidden; at 64K
+127.0 + 71.9 + 47.5 + 2.4 = 248.8 vs 248.0. So **83–89% of the host step is serialized today**
+(measured; the upper bound is the device time that elapsed without a wait). The device work at
+250K (836 s) exceeds the host step (775 s), so there is enough device time to hide it if the chain
+pipelined chunks.
+
+**Decision: build the chunk wavefront, not the tensor-core prompt kernel first.** The measured
+ceiling of the wavefront is (1 − 0.167) × 775 ≈ **645 s** at 250K; a 2.5× prompt kernel saves
+673 × (1 − 1/2.5) ≈ **404 s** and leaves the 775 s host step untouched. The wavefront's risk is
+the per-(chunk, layer) KV-upload ordering — the typed-mirror bug's neighbourhood — so it gates on
+`bench/gate.sh` and a 250K needle at every step. Tensor cores remain the fallback if the
+wavefront cannot be made correct, and the complement afterwards (the kernel work is orthogonal).
+Provenance: measured (phase and tier counters from the runs above), not derived.
+
+## 15.6 DSpark gate, measured
+
+llama.cpp b12588, same IQ3_XXS, q4_0 KV, `--n-cpu-moe 12`, `-b 512 -ub 128`, temp 0,
+`cache_prompt=false`, 32 tokens (`bench/dspark_gate.py`; rows in `bench/results-dspark.json`):
+
+| size | without `-md` | with `-md` | prompt tok/s (no/yes) | draft accepted |
+|---|---:|---:|---:|---:|
+| 8K | 18.66 tok/s | 19.60 tok/s (+5.1%) | 145.1 / 146.1 | 21/27, 0.778, 2.33/verify |
+| 64K | 16.20 tok/s | 17.19 tok/s (+6.1%) | 137.2 / 138.1 | 21/27, 0.778, 2.33/verify |
+
+The engine's 64K decode on the same tree is **17.77–18.09 tok/s** (B1/B2 in §15.4). llama.cpp
+without the drafter is 8.9–11.7% below that (inside the ~10% parity band), and with DSpark it is
+still 3.4–5.2% below the engine. The drafter is worth +6.1% at 64K and +5.1% at 8K — not a large
+delta, so no 128K cell was needed. **Decision (the rule, applied):** the engine is at decode
+parity with llama.cpp; drop decode-speed work in favour of prefill, and do not build the external
+`dflash` drafter path — in this engine's setting it would buy at most ~6% decode, while our
+no-drafter path already leads llama.cpp's drafter-assisted one at 64K.
+
 ## Appendix — benchmark commands
 
 ```bash

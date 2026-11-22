@@ -40,6 +40,8 @@ RX = {
                          r"prefetched (?P<pf>[0-9]+) \((?P<pf_used>[0-9]+) used\), (?P<kept>[0-9]+) cold experts "
                          r"\((?P<kept_rows>[0-9]+) rows\) kept on the CPU"),
     "host": re.compile(r"inkling2 host: (?P<kv_s>[0-9.]+) s quantizing.*?, (?P<host_s>[0-9.]+) s of routed experts"),
+    "chain": re.compile(r"(?P<wait_ms>[0-9.]+) ms waiting for the device, (?P<host_ms>[0-9.]+) ms of routed experts "
+                        r"on the host, (?P<dm_layers>[0-9]+) layer steps' experts in the frame"),
     "kv": re.compile(r"inkling2 attention kernels: (?P<s>[0-9.]+) s over (?P<calls>[0-9]+) calls"),
 }
 
@@ -87,9 +89,11 @@ def run_cell(binary, snap, prompt, ctx, n, env, logdir, timeout):
                  subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader"],
                                 capture_output=True, text=True).stdout.strip()))
     row = parse(log)
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+                          capture_output=True, text=True).stdout.strip()
     row.update({"cell": env.get("COLI_VK_TIER_WHOLE", "0"), "prompt": os.path.basename(prompt),
                 "ctx": ctx, "n": n, "log": log, "wall_s": round(time.time() - t0, 1),
-                "free_before": free_before})
+                "free_before": free_before, "commit": head, "provenance": "measured"})
     return row
 
 
@@ -109,7 +113,7 @@ def summarize(r):
         except Exception:
             pass
     return ("n=%-2s budget %s %s = %s exp | free %s GB | frame %s/%s layers | prefill %s s | dec %s tok/s | "
-            "RSS %s GB | evict %s up %s %s %s warm | cold %s kept %s rows | hidden %s%% dev / hostov %s | %s" % (
+            "RSS %s GB | evict %s up %s %s %s warm %s | cold %s kept %s rows | hidden %s%% dev / hostov %s | %s" % (
                 r["cell"], b.get("val", "?"), b.get("unit", ""), b.get("n", "?"), f.get("gb", "?"),
                 l.get("n", "?"), l.get("l", "?"), p.get("s", "?"), dec, p.get("rss", "?"),
                 t.get("evictions", "?"), t.get("uploads", "?"), t.get("up_gib", "?"), t.get("up_unit", ""),
@@ -148,11 +152,19 @@ def main():
     for whole, prompt, ctx, n in cells:
         r = run_cell(a.bin, a.snap, prompt, ctx, n, {"COLI_VK_TIER_WHOLE": whole}, a.logdir, a.timeout)
         t = r.get("tier", {})
-        try:  # the fraction of the host CPU share that the device time hid
+        c = r.get("chain", {})
+        try:
+            # The fraction of the *host routed-expert step* already hidden under device work.
+            # Overlapped host work cannot exceed either the tier's CPU share that ran in the
+            # streaming window (cpu_ms) or the device time that elapsed without a wait
+            # (dev_ms - wait_ms); divide by the chain's measured host expert time.
             dev, wait, cpu = float(t["dev_ms"]), float(t["wait_ms"]), float(t["cpu_ms"])
-            r["host_ovl"] = round(max(0.0, dev - wait) / cpu, 3) if cpu > 0 else None
+            host = float(c["host_ms"])
+            r["hidden_dev_s"] = round(max(0.0, dev - wait) / 1e3, 1)
+            r["host_ovl"] = round(min(cpu, max(0.0, dev - wait)) / host, 3) if host > 0 else None
+            r["host_ovl_ub"] = round(max(0.0, dev - wait) / host, 3) if host > 0 else None
         except Exception:
-            r["host_ovl"] = None
+            r["host_ovl"] = r["host_ovl_ub"] = None
         rows.append(r)
         existing.append(r)
         print(summarize(r), flush=True)

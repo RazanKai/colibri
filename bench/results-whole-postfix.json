@@ -1,0 +1,162 @@
+[
+ {
+  "free": {
+   "gb": "11.2"
+  },
+  "budget": {
+   "val": "7.47",
+   "unit": "GiB",
+   "n": "2297"
+  },
+  "layers": {
+   "n": "0",
+   "l": "24"
+  },
+  "phases": {
+   "fill": "4.4",
+   "expert": "123.6",
+   "shared": "0.0",
+   "attn": "81.6",
+   "other": "47.5"
+  },
+  "prefill": {
+   "s": "256.3",
+   "gen": "16",
+   "ds": "0.9",
+   "tps": "17.53",
+   "rss": "9.4"
+  },
+  "tune": {
+   "n": "15",
+   "s": "0.856"
+  },
+  "tier": {
+   "served": "24550302",
+   "routed": "24572928",
+   "pct": "99.9",
+   "uploads": "3043",
+   "up_gib": "9.58",
+   "up_unit": "GiB",
+   "warm": "2297",
+   "evictions": "747",
+   "qfull": "0",
+   "rated": "0",
+   "failed": "0",
+   "dev_ms": "81305.3",
+   "cpu_ms": "15767.6",
+   "wait_ms": "45327.6",
+   "hidden_pct": "44"
+  },
+  "stream": {
+   "steps": "3024",
+   "cold": "8819",
+   "bytes": "28.57 GiB",
+   "gbps": "5.05",
+   "rows": "251188",
+   "subs": "9024",
+   "pf": "8906",
+   "pf_used": "8589",
+   "kept": "9844",
+   "kept_rows": "22066"
+  },
+  "chain": {
+   "wait_ms": "63645.1",
+   "host_ms": "157434.4",
+   "dm_layers": "0"
+  },
+  "answer": "The quick brown fox jumps over the lazy dog. In a mixture",
+  "found": false,
+  "cell": "12",
+  "prompt": "prompt-64k.txt",
+  "ctx": 70000,
+  "n": 16,
+  "log": "/var/tmp/scratch/opencode/colibri-runs/212005-prompt-64k-n12.log",
+  "wall_s": 270.9,
+  "free_before": "10857 MiB",
+  "commit": "0a2762a",
+  "provenance": "measured",
+  "hidden_dev_s": 36.0,
+  "host_ovl": 0.1,
+  "host_ovl_ub": 0.229
+ },
+ {
+  "free": {
+   "gb": "11.2"
+  },
+  "budget": {
+   "val": "7.44",
+   "unit": "GiB",
+   "n": "2286"
+  },
+  "layers": {
+   "n": "6",
+   "l": "24"
+  },
+  "phases": {
+   "fill": "2.8",
+   "expert": "124.0",
+   "shared": "0.0",
+   "attn": "94.0",
+   "other": "48.2"
+  },
+  "prefill": {
+   "s": "268.0",
+   "gen": "16",
+   "ds": "1.0",
+   "tps": "14.58",
+   "rss": "9.1"
+  },
+  "tune": {
+   "n": "15",
+   "s": "1.029"
+  },
+  "tier": {
+   "served": "24550772",
+   "routed": "24572928",
+   "pct": "99.9",
+   "uploads": "2996",
+   "up_gib": "9.40",
+   "up_unit": "GiB",
+   "warm": "2286",
+   "evictions": "710",
+   "qfull": "0",
+   "rated": "0",
+   "failed": "0",
+   "dev_ms": "80517.3",
+   "cpu_ms": "14010.2",
+   "wait_ms": "45073.8",
+   "hidden_pct": "44"
+  },
+  "stream": {
+   "steps": "3024",
+   "cold": "18417",
+   "bytes": "58.06 GiB",
+   "gbps": "4.98",
+   "rows": "1296514",
+   "subs": "9087",
+   "pf": "18329",
+   "pf_used": "18178",
+   "kept": "9331",
+   "kept_rows": "21513"
+  },
+  "chain": {
+   "wait_ms": "62381.0",
+   "host_ms": "156913.2",
+   "dm_layers": "0"
+  },
+  "answer": "The quick brown fox jumps over the lazy dog. In a mixture",
+  "found": false,
+  "cell": "17",
+  "prompt": "prompt-64k.txt",
+  "ctx": 70000,
+  "n": 16,
+  "log": "/var/tmp/scratch/opencode/colibri-runs/212436-prompt-64k-n17.log",
+  "wall_s": 283.4,
+  "free_before": "10808 MiB",
+  "commit": "0a2762a",
+  "provenance": "measured",
+  "hidden_dev_s": 35.4,
+  "host_ovl": 0.089,
+  "host_ovl_ub": 0.226
+ }
+]
