@@ -60,6 +60,7 @@ typedef struct {
     uint8_t host;                      /* dev 0 with its tensors in the host pool (coli_vk_tier_host_pool): the
                                         * primary device reads them over PCIe, in a batch and in the dense chain */
     uint8_t up;                        /* T.full: on its way from the host pool to the device (promote) */
+    uint8_t pin;                       /* COLI_VK_TIER_WHOLE: a whole layer's expert, never a promotion's victim */
     ColiVkExpert *hex;                 /* T.full: its copy in the host pool (ex itself while host) */
 } VSlot;
 /* dev: the place (place_of); src: a promotion's host pool copy, copied up instead of buf */
@@ -727,7 +728,7 @@ static void refresh_candidates(void) {
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (T.full && (v->host || !v->hex))) continue;
+        if (v->state != VS_RESIDENT || v->pin || (T.full && (v->host || !v->hex))) continue;
         int k = vcls_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
         uint64_t sc = score(v), *cs = T.cand_score[k];
         if (T.ncand[k] == VKT_CAND && sc >= cs[VKT_CAND - 1]) continue;
@@ -748,7 +749,7 @@ static int peek_victim(int k, uint64_t hs) {
     while (T.ncand[k]) {
         int i = T.cand[k][0];
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT || (T.full && v->host)) { drop_victim(k); continue; }
+        if (v->state != VS_RESIDENT || v->pin || (T.full && v->host)) { drop_victim(k); continue; }
         uint64_t cs = score(v);
         /* T.full: a swap copies nothing back and no CPU time goes into it, so any hotter one wins */
         return hs > (T.full ? cs + ((uint64_t)VKT_UP_MARGIN << 8) : cs + (cs >> 2) + (4u << 8)) ? i : -1;
@@ -956,7 +957,7 @@ int vkt_plan(int *layers, int *eids, int max) {
                 for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++) {
                     VSlot *v = &T.s[(size_t)l * E + e];
                     if (v->state != VS_NONE) continue;
-                    v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++;
+                    v->state = VS_QUEUED; v->pin = 1; set_place(v, 0); T.queued++; T.dque[0]++;
                     layers[k] = l; eids[k] = e; k++;
                 }
             }
