@@ -6,9 +6,11 @@ completes and decode runs. The 250K needle test is **not passing yet**: the same
 at 943 tokens, so the blocker is the model/prompt, not the KV or the context path (evidence in
 §6).
 **250K/262K speed pass (P0–P6, §14):** the attention kernels were rebuilt (GQA-shared decode,
-K-tile transpose, one tile read per query head, exp2); 64K prefill 387.1 → 266.6 s (1.45×),
-the device side of the layers 202.6 → 69.5 s (2.91×), decode 14.94 → 16.55 tok/s. 1M work is
-postponed (see §7); a measurement harness and the f16 gate now exist.
+K-tile transpose, one tile read per query head, exp2). 64K: prefill 387.1 → 266.6 s (1.45×),
+device side 202.6 → 69.5 s (2.91×), decode 14.94 → 16.55 tok/s. 250K: prefill **3651.5 →
+1880.2 s (1.94×)**, device side **2706.7 → 832.5 s (3.25×)**, decode **8.44 → 11.84 tok/s
+(1.40×)**; the kernel itself went 1.0 → 5.0 TFLOP/s. 1M work is postponed (see §7); a
+measurement harness and the f16 gate now exist.
 Target: **250K-token context (MVP)**, **1M-token context (Stage 2)**
 Engine: Colibri `dev` (v2.2.0), `inkling2` family in `c/inkling.c` + `c/inkling2.h`
 Model: `unsloth/Inkling-2-Mini-GGUF` UD-IQ3_XXS, imported with `coli` (`arch inkling2`)
@@ -443,7 +445,24 @@ done in this pass.
 `bench/sweep_kernels.py` (`--quick`: 64K/250K, q4, H 24/64, chunk and step) writes
 `bench/results-speed.json` with `provenance: measured` on every cell and records the env it ran
 under, so the same file serves the `COLI_CUDA_RELATTN_GQA=0` / `COLI_CUDA_RELATTN_QT=0` A/Bs.
-Engine-level cells (chunk rows, tier budget) are still to be swept.
+Eight cells, 22 s: 250K prompt chunk at Mini's 24 heads **672 ms / 4.90 TFLOP/s**, decode step
+3.68 ms / 876 GFLOP/s; the same at H=64 1656 ms / 5.30 TFLOP/s and 5.65 ms / 1519 GFLOP/s.
+
+`bench/sweep_engine.py` (8K prompt, 16 tokens, one cell ~30 s) writes `bench/results-engine.json`:
+
+| 8K, 8,027 tokens | prefill | device side | experts | other |
+|---|---:|---:|---:|---:|
+| chunk 1024 | 29.5 s | 4.4 s | 17.6 s | 5.6 s |
+| chunk 2048 | 29.4 s | 4.8 s | 18.3 s | 5.4 s |
+| **chunk 4096** | **1275.5 s** | 320.2 s | 903.7 s | 47.0 s |
+| chunk 1024, f16 KV | 30.2 s | 4.9 s | 20.1 s | 4.5 s |
+| chunk 1024, q4, no prefix store | 28.1 s | 4.3 s | 17.6 s | 5.8 s |
+
+Two results worth keeping: the prompt chunk's rows are flat from 1024 to 2048 and then
+**catastrophic at 4096** (the tier streams a 4096-row step's cold experts in one go: 903.7 s of
+experts, 14× the 2048 cell) — so 1024/2048 is the safe band; and f16 KV costs ~7% at 8K with no
+attention gain (the kernel widens both types the same way), so q4 stays the long-context setting.
+The prefix store is ~free (28.1 s with it off vs 29.5 s with it on, within run noise).
 
 ### 14.8 End to end, 64K
 
@@ -464,7 +483,34 @@ The 250K run of §5 is repeated with these kernels in §14.9.
 
 ### 14.9 250K with the new kernels
 
-(filled from the run log: `/var/tmp/scratch/kvtest/250k-new.err`.)
+Same command and model as §5 (`CTX_MAX=262144`, `INK2_KV=q4`, 24 tokens), on the rebuilt
+kernels. Phase line: `fill 5.3 s | expert-mm 865.3 s | attn 832.5 s | other 179.0 s`.
+
+| 250K, 250,156 prompt tokens | §5 | now | |
+|---|---:|---:|---:|
+| prefill | 3651.5 s | **1880.2 s** | 1.94× |
+| device side (the `attn` phase) | 2706.7 s | **832.5 s** | 3.25× |
+| routed experts | 769.4 s | 865.3 s | |
+| other | 172.9 s | 179.0 s | |
+| decode | 8.44 tok/s | **11.84 tok/s** | 1.40× |
+| RSS | 12.2 GB | 12.6 GB | |
+| device | 2802 MiB | 2825 MiB | |
+
+The attention accounting (`INK2CC_RA_STATS=1`): ring 9800 calls / 10.23 Gpair, global 1960 calls /
+250.31 Gpair, decode 1104 calls; the chain waited 627.3 s on the device and ran 982.4 s of routed
+experts on the host, with 0 layer steps' experts in the frame (at 250K the tier held 1718 experts,
+5.46 GiB of 5.64 GiB, so no layer's whole set is resident — §14.5).
+
+The expert phase is **not** comparable to §5's: the tier's budget came out 5.46 GiB this run
+(1718 experts, 7262 evictions, 28.4 GiB uploaded) against 6.06 GiB then (1849 experts, 6393
+evictions, 26.4 GiB), so 865.3 s of routed experts is the tier's variance, not this work. The
+attention and the prefill total are the comparable figures.
+
+Range audit at this context (`INK_KV_STATS=1`): max |K| 20.44, max |V| 11.27, block scale
+max 2.92 (K) / 1.611 (V), 0% of 493,780,992 values above f16's 65504.
+
+Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-new.out`.
+
 
 ### 14.10 What is still open
 

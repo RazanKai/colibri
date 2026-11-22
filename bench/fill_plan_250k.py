@@ -70,7 +70,7 @@ def main(path, outpath=None):
     if "attention" in got:
         table += ["The attention accounting (`INK2CC_RA_STATS=1`): ring %s calls / %s Gpair, global %s calls /" % (
             got["attention"]["rcalls"], got["attention"]["rpairs"], got["attention"]["gcalls"]),
-            "%s Gpair, decode %s calls; the chain waited %.1f ms on the device and ran %.1f s of routed" % (
+            "%s Gpair, decode %s calls; the chain waited %.1f s on the device and ran %.1f s of routed" % (
             got["attention"]["gpairs"], got["attention"]["dcalls"], f(ch["wait"]) / 1e3, f(ch["host"]) / 1e3),
             "experts on the host, with %s layer steps' experts in the frame." % ch["dml"]]
     if "kvstats" in got:
