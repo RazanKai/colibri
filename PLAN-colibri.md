@@ -419,12 +419,15 @@ device**; the flag is kept for a card where VRAM, not PCIe, is the binding const
 
 ### 14.5 P4 — the expert/decode floor
 
-The in-frame MoE path is present (`COLI_CUDA_CHAIN_MOE`) but gates every layer on a per-layer
-format check (`ink2cc_dm_layer`: one format a layer, every expert resident, a `cc_moe` block
-type). This checkpoint's tier reports fmt 122 (gate/up) and 140 (down); **1 of 24 layers**
-qualifies and runs its experts in the frame (29–47 layer steps in the 64K runs). The concrete
-blocker is a `cc_moe` IQ2_S (fmt 122) path; until then the host's expert step dominates decode
-and this item stays open.
+The in-frame MoE path is present (`COLI_CUDA_CHAIN_MOE`) but gates every layer on the tier's
+table: `ink2cc_dm_layer` wants every expert of the layer device-resident and one format a layer,
+and `ink2cc_dm_table` sets `ch->dm_on[i] = nres == E`. The formats are **not** the blocker —
+`cc_moe_block_type(22)` covers this checkpoint's fmt 122 gate/up and `fg == 140` its NVFP4 down.
+The blocker is capacity: at 250K the tier holds 1849 of ~6144 expert slots (6.06 GiB), so a
+whole layer of 256 experts is rarely complete — **1 of 24 layers** qualified in the 64K runs
+(29–47 layer steps ran in the frame). The fix is a per-expert frame route (a partial layer) or a
+tier policy that packs whole layers, not a new block format. Until then the host's expert step
+dominates decode and this item stays open.
 
 ### 14.6 P5 — the overhead
 
