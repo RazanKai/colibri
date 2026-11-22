@@ -281,6 +281,8 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
         }
     }
     const int win = kv_ring_rows(c, li, m->max_t);
+    const size_t krb = ink_kv_row(m, li);
+    const int ktype = m->kv_type;
     const float scale = (float)(1.0 / sqrt((double)hd));
     float *ctx = falloc((int64_t)S * qdim);
     #pragma omp parallel
@@ -308,13 +310,15 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
                 const float *qv = q + (int64_t)s * qdim + h * hd;
-                const float *Kh = Kc[li] + ((int64_t)(h / group) * win) * hd;
                 const float *Kb = k + srow + (int64_t)(h / group) * hd;
+                void *Kbase = Kc[li];
                 float mx = sk[(int64_t)s * H + h];
                 for (int t = t0; t <= qpos; t++) {
-                    const float *kv = t < tb ? Kh + (int64_t)(t % win) * hd : Kb + (int64_t)(t - sp0) * kvdim;
                     const int dist = qpos - t;
-                    float lg = tau * (dot_f32_lanes(qv, kv, hd) * scale + (dist < ext ? rl[dist] : 0.f));
+                    float acc = t < tb
+                        ? ink_kv_dot(ktype, qv, ink_kv_at(Kbase, krb, win, h / group, t % win), hd)
+                        : dot_f32_lanes(qv, Kb + (int64_t)(t - sp0) * kvdim, hd);
+                    float lg = tau * (acc * scale + (dist < ext ? rl[dist] : 0.f));
                     sc[t - t0] = lg;
                     if (lg > mx) mx = lg;
                 }
@@ -323,12 +327,12 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
                 for (int j = 0; j < n; j++) { sc[j] = expf(sc[j] - mx); den += sc[j]; }
                 float *cx = ctx + (int64_t)s * qdim + h * hd;
                 for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                const float *Vh = Vc[li] + ((int64_t)(h / group) * win) * hd;
                 const float *Vb = vv + srow + (int64_t)(h / group) * hd;
+                void *Vbase = Vc[li];
                 for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = t < tb ? Vh + (int64_t)(t % win) * hd : Vb + (int64_t)(t - sp0) * kvdim;
                     const float a = sc[t - t0] / den;
-                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
+                    if (t < tb) ink_kv_axpy(ktype, cx, a, ink_kv_at(Vbase, krb, win, h / group, t % win), hd);
+                    else for (int d = 0; d < hd; d++) cx[d] += a * Vb[(int64_t)(t - sp0) * kvdim + d];
                 }
                 const float *gr = gt + (int64_t)s * qdim + h * hd;
                 for (int d = 0; d < hd; d++) cx[d] *= 1.f / (1.f + expf(-gr[d]));
@@ -339,9 +343,9 @@ static void ink2_attention(Model *m, Layer *l, int li, const float *xq, const fl
     const int s0 = !mr && S - win > 0 ? S - win : 0;
     for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {
         const int t = mr ? mr[s].pos : pos0 + s;
-        float *Kd = mr ? mr[s].seq->K[li] : m->K[li], *Vd = mr ? mr[s].seq->V[li] : m->V[li];
-        memcpy(Kd + ((int64_t)h * win + t % win) * hd, k + (int64_t)s * kvdim + h * hd, hd * sizeof(float));
-        memcpy(Vd + ((int64_t)h * win + t % win) * hd, vv + (int64_t)s * kvdim + h * hd, hd * sizeof(float));
+        void *Kd = mr ? mr[s].seq->K[li] : m->K[li], *Vd = mr ? mr[s].seq->V[li] : m->V[li];
+        ink_kv_put(ktype, ink_kv_at(Kd, krb, win, h, t % win), k + (int64_t)s * kvdim + h * hd, hd);
+        ink_kv_put(ktype, ink_kv_at(Vd, krb, win, h, t % win), vv + (int64_t)s * kvdim + h * hd, hd);
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
     free(q); free(k); free(vv); free(rr); free(gt); free(sk); free(ctx);

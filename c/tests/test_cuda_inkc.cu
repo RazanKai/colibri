@@ -16,6 +16,7 @@
 #include <vector>
 #include "../backend_cuda.h"
 #include "../cuda_chain.h"
+#include "../ink_kv.h"   /* the typed mirror rows the host cache holds */
 
 static const ColiCudaChainOps *T;
 static int fails;
@@ -26,6 +27,11 @@ static std::vector<float> fvec(size_t n, float scale) { std::vector<float> v(n);
 static CcBuf *upf(const std::vector<float> &v) {
     CcBuf *b = T->buf(v.empty() ? 4 : v.size() * 4, CC_DEV);
     if (!b || !T->begin() || !T->write(b, 0, v.data(), v.size() * 4) || !T->submit(1)) { printf("  FAIL upload\n"); fails++; }
+    return b;
+}
+static CcBuf *upb(const void *p, size_t bytes) {
+    CcBuf *b = T->buf(bytes ? bytes : 4, CC_DEV);
+    if (!b || !T->begin() || !T->write(b, 0, p, bytes) || !T->submit(1)) { printf("  FAIL upload\n"); fails++; }
     return b;
 }
 static std::vector<float> down(CcBuf *b, size_t off, size_t n) {
@@ -68,11 +74,35 @@ static void test_sconv(int C, int CK, int S1, int S2) {
     T->free(bx); T->free(bw); T->free(br);
 }
 
-static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink) {
+static void test_relattn(int S, int pos_base, int window, int cap, int hd, int dr, int ext, int sink, int kv_type = 0) {
     int H = 4, KVH = 2, kvd = KVH * hd, Tn = pos_base + S, koff = 32, roff = 16, poff = 24, toff = 8, soff = toff + S + 3;
     std::vector<float> q = fvec((size_t)S * H * hd, 1.f), kt = fvec((size_t)Tn * kvd, 1.f), vt = fvec((size_t)Tn * kvd, 1.f);
     std::vector<float> r = fvec((size_t)S * H * dr, 0.5f), relp = fvec((size_t)dr * ext, 0.5f), snk = fvec((size_t)S * H, 3.f), tau(S);
+    std::vector<float> kt2 = kt, vt2 = vt;   /* the rows the mirror decodes to (a typed mirror's) */
     for (int s = 0; s < S; s++) tau[s] = 1.f + (rnd() % 1000) / 2000.f;
+    /* the mirror: f32 rows, or the host's f16/q8/q4 rows (ink_kv.h) that the kernel dequantizes;
+     * the reference reads those same decoded rows back */
+    CcBuf *bk = NULL, *bv = NULL;
+    if (!kv_type) {
+        size_t nr = (size_t)koff + (size_t)KVH * cap * hd;
+        std::vector<float> kr(nr), vr(nr);
+        for (int t = 0; t < pos_base; t++) for (int h = 0; h < KVH; h++) {
+            memcpy(&kr[koff + ((size_t)h * cap + t % cap) * hd], &kt[(size_t)t * kvd + h * hd], hd * 4);
+            memcpy(&vr[koff + ((size_t)h * cap + t % cap) * hd], &vt[(size_t)t * kvd + h * hd], hd * 4);
+        }
+        bk = upf(kr); bv = upf(vr);
+    } else {
+        const size_t rb = ink_kv_row_bytes(kv_type, hd);
+        std::vector<unsigned char> krt((size_t)KVH * cap * rb, 0), vrt((size_t)KVH * cap * rb, 0);
+        for (int t = 0; t < pos_base; t++) for (int h = 0; h < KVH; h++) {
+            const size_t o = ((size_t)h * cap + t % cap) * rb;
+            ink_kv_put(kv_type, &krt[o], &kt[(size_t)t * kvd + h * hd], hd);
+            ink_kv_put(kv_type, &vrt[o], &vt[(size_t)t * kvd + h * hd], hd);
+            ink_kv_get(kv_type, &kt2[(size_t)t * kvd + h * hd], &krt[o], hd);
+            ink_kv_get(kv_type, &vt2[(size_t)t * kvd + h * hd], &vrt[o], hd);
+        }
+        bk = upb(krt.data(), krt.size()); bv = upb(vrt.data(), vrt.size());
+    }
     float scale = 1.f / sqrtf((float)hd);
     std::vector<float> ref((size_t)S * H * hd);
     for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
@@ -80,7 +110,8 @@ static void test_relattn(int S, int pos_base, int window, int cap, int hd, int d
         std::vector<double> sc(n); double mx = -1e300, sum = 0;
         for (int j = 0; j < n; j++) {
             int t = t0 + j, dist = qpos - t;
-            double a = 0; for (int d = 0; d < hd; d++) a += (double)q[((size_t)s * H + h) * hd + d] * kt[(size_t)t * kvd + kvh * hd + d];
+            const std::vector<float> &kk = t < pos_base ? kt2 : kt, &vvt = t < pos_base ? vt2 : vt;
+            double a = 0; for (int d = 0; d < hd; d++) a += (double)q[((size_t)s * H + h) * hd + d] * kk[(size_t)t * kvd + kvh * hd + d];
             double b = 0; if (dist < ext) for (int k = 0; k < dr; k++) b += (double)r[((size_t)s * H + h) * dr + k] * relp[k * ext + dist];
             sc[j] = tau[s] * (a * scale + b); if (sc[j] > mx) mx = sc[j];
         }
@@ -89,28 +120,28 @@ static void test_relattn(int S, int pos_base, int window, int cap, int hd, int d
         if (sink) sum = exp(sk - mx);
         for (int j = 0; j < n; j++) { sc[j] = exp(sc[j] - mx); sum += sc[j]; }
         for (int d = 0; d < hd; d++) {
-            double a = 0; for (int j = 0; j < n; j++) a += sc[j] / sum * vt[(size_t)(t0 + j) * kvd + kvh * hd + d];
+            double a = 0; for (int j = 0; j < n; j++) { const std::vector<float> &vvt = (t0 + j) < pos_base ? vt2 : vt; a += sc[j] / sum * vvt[(size_t)(t0 + j) * kvd + kvh * hd + d]; }
             ref[((size_t)s * H + h) * hd + d] = (float)a;
         }
-    }
-    size_t nr = (size_t)koff + (size_t)KVH * cap * hd;
-    std::vector<float> kr(nr), vr(nr);
-    for (int t = 0; t < pos_base; t++) for (int h = 0; h < KVH; h++) {
-        memcpy(&kr[koff + ((size_t)h * cap + t % cap) * hd], &kt[(size_t)t * kvd + h * hd], hd * 4);
-        memcpy(&vr[koff + ((size_t)h * cap + t % cap) * hd], &vt[(size_t)t * kvd + h * hd], hd * 4);
     }
     size_t ks = 4, vs = ks + (size_t)S * kvd, nsc = vs + (size_t)S * kvd;
     std::vector<float> scr(nsc), rb(roff + (size_t)S * H * dr), pb(poff + (size_t)dr * ext), tb((size_t)soff + (size_t)S * H);
     memcpy(&scr[ks], &kt[(size_t)pos_base * kvd], (size_t)S * kvd * 4); memcpy(&scr[vs], &vt[(size_t)pos_base * kvd], (size_t)S * kvd * 4);
     memcpy(&rb[roff], r.data(), r.size() * 4); memcpy(&pb[poff], relp.data(), relp.size() * 4);
     memcpy(&tb[toff], tau.data(), S * 4); memcpy(&tb[soff], snk.data(), snk.size() * 4);
-    CcBuf *bq = upf(q), *bk = upf(kr), *bv = upf(vr), *bs = upf(scr), *brr = upf(rb), *bp = upf(pb), *bt = upf(tb);
+    CcBuf *bq = upf(q), *bs = upf(scr), *brr = upf(rb), *bp = upf(pb), *bt = upf(tb);
     CcBuf *bo = T->buf((size_t)S * H * hd * 4, CC_DEV);
     CcRelAttn p = {S, H, KVH, hd, pos_base, cap, window, ext, dr, 0, H * hd, 0, H * hd, koff, koff, (int)ks, (int)vs, kvd,
                    roff, H * dr, poff, toff, scale, sink, sink ? soff : 0};
+    if (kv_type) {
+        p.k_off = p.v_off = 0;   /* byte offsets into the typed mirror */
+        p.k_rowb = (int)ink_kv_row_bytes(kv_type, hd);
+        p.kv_type = kv_type;
+    }
     int ok = T->begin() && T->relattn(bq, bk, bv, bo, bs, brr, bp, bt, &p) && T->submit(1);
     std::vector<float> y = down(bo, 0, ref.size());
-    char what[128]; snprintf(what, sizeof what, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d", S, pos_base, window, cap, hd, dr, ext, sink);
+    char what[160]; snprintf(what, sizeof what, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d %s",
+                             S, pos_base, window, cap, hd, dr, ext, sink, ink_kv_name(kv_type));
     check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 2e-5, what);
     CcBuf *all[] = {bq, bk, bv, bs, brr, bp, bt, bo};
     for (CcBuf *b : all) T->free(b);
@@ -221,6 +252,12 @@ int main(void) {
     test_relattn(2, 9, 0, 64, 256, 64, 8, 1);
     test_relattn(1, 1500, 0, 1501, 128, 16, 512, 1);   /* a decode step at 1500 positions: twelve tiles split and joined */
     test_relattn(8, 700, 0, 708, 64, 8, 64, 0);
+    for (int t = 1; t <= 3; t++) {   /* the typed mirrors: f16, q8, q4, the scalar and tiled kernels */
+        test_relattn(1, 300, 0, 400, 128, 16, 128, 1, t);
+        test_relattn(20, 90, 64, 64, 128, 16, 64, 1, t);
+        test_relattn(40, 300, 0, 340, 64, 8, 64, 0, t);
+        test_relattn(9, 40, 0, 64, 256, 16, 32, 1, t);
+    }
     printf("loop gate\n");
     {
         const int caps = T->size >= offsetof(ColiCudaChainOps, ink2_caps) + sizeof T->ink2_caps && T->ink2_caps ? T->ink2_caps() : 0;

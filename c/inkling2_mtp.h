@@ -383,17 +383,18 @@ static int ink2m_step(Model *m, int tok, int t, int *out) {
     size_t ringn = 0;
     for (int i = 0; i < c->n_state; i++) {   /* a loop pass's layers have rings of their own */
         const int win = kv_ring_rows(c, i, m->max_t);
-        if (win < m->max_t) ringn += (size_t)2 * L_KV(c, i) * (K + 1) * L_HD(c, i);
+        if (win < m->max_t) ringn += (size_t)2 * L_KV(c, i) * (K + 1) * ink_kv_row(m, i);
     }
-    float *ring = ringn ? falloc((int64_t)ringn) : NULL, *rp = ring;
+    char *ring = ringn ? malloc(ringn) : NULL, *rp = ring;
     for (int i = 0; i < c->n_state; i++) {
-        const int win = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i);
+        const int win = kv_ring_rows(c, i, m->max_t);
+        const size_t rb = ink_kv_row(m, i);
         if (win >= m->max_t) continue;
         for (int j = 0; j <= K; j++)
-            for (int h = 0; h < L_KV(c, i); h++, rp += 2 * hd) {
-                const int64_t off = ((int64_t)h * win + (t + j) % win) * hd;
-                memcpy(rp, m->K[i] + off, (size_t)hd * sizeof(float));
-                memcpy(rp + hd, m->V[i] + off, (size_t)hd * sizeof(float));
+            for (int h = 0; h < L_KV(c, i); h++, rp += 2 * rb) {
+                const int64_t off = ((int64_t)h * win + (t + j) % win) * rb;
+                memcpy(rp, (char *)m->K[i] + off, rb);
+                memcpy(rp + rb, (char *)m->V[i] + off, rb);
             }
     }
     double t0 = now_s();
@@ -412,15 +413,16 @@ static int ink2m_step(Model *m, int tok, int t, int *out) {
         ink_pin_state_restore(m, snap);
         rp = ring;
         for (int i = 0; i < c->n_state; i++) {
-            const int win = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i);
+            const int win = kv_ring_rows(c, i, m->max_t);
+            const size_t rb = ink_kv_row(m, i);
             if (win >= m->max_t) continue;
             /* every row: the forward again reads the older positions there before it writes the
              * kept ones (a slot of a kept row held a position the window still sees) */
             for (int j = 0; j <= K; j++)
-                for (int h = 0; h < L_KV(c, i); h++, rp += 2 * hd) {
-                    const int64_t off = ((int64_t)h * win + (t + j) % win) * hd;
-                    memcpy(m->K[i] + off, rp, (size_t)hd * sizeof(float));
-                    memcpy(m->V[i] + off, rp + hd, (size_t)hd * sizeof(float));
+                for (int h = 0; h < L_KV(c, i); h++, rp += 2 * rb) {
+                    const int64_t off = ((int64_t)h * win + (t + j) % win) * rb;
+                    memcpy((char *)m->K[i] + off, rp, rb);
+                    memcpy((char *)m->V[i] + off, rp + rb, rb);
                 }
         }
         if (m->kvp.len > t) m->kvp.len = t;

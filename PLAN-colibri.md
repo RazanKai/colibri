@@ -1,0 +1,336 @@
+# PLAN-colibri — Inkling 2 Mini long context in Colibri
+
+Status: **Stage 1 implemented and measured** (f16/q8/q4 host KV, typed CUDA mirror, tiled
+prefill attention). 64K now beats the Unsloth b12588 baseline on prefill; 250K loads, prefill
+completes and decode runs. The 250K needle test is **not passing yet**: the same harness fails
+at 943 tokens, so the blocker is the model/prompt, not the KV or the context path (evidence in
+§6).
+Target: **250K-token context (MVP)**, **1M-token context (Stage 2)**
+Engine: Colibri `dev` (v2.2.0), `inkling2` family in `c/inkling.c` + `c/inkling2.h`
+Model: `unsloth/Inkling-2-Mini-GGUF` UD-IQ3_XXS, imported with `coli` (`arch inkling2`)
+Host: RTX 5070 12 GB, i5-10400F (6C/12T, AVX2), 23 GB RAM, NVMe
+
+## 1. Why this plan exists
+
+Colibri already implements the hierarchical placement we wanted from Strata:
+
+- hot experts in VRAM (expert tier);
+- warm experts in RAM (LRU + pinned history);
+- cold experts streamed from NVMe;
+- CPU and device compute overlapped;
+- prefix reuse for agent turns.
+
+The missing pieces for long context were the **KV cache** (fp32, 16 GB at 250K) and the
+**attention/prefill path** (73% of the 64K prefill). Both are now addressed:
+
+1. the host cache is f16/q8/q4 (`INK2_KV`), with the CUDA chain's device mirror of the same
+   type, so 250K fits on both sides;
+2. the CUDA chain runs a tiled prompt kernel that reads each K/V row once per tile of query
+   rows instead of once per query row, **3.6× faster attention at 64K** than the old kernel.
+
+The llama.cpp plan (`PLAN.md`) has q4 KV today but no expert cache. Colibri now beats Unsloth
+on **prefill** at 64K and is still behind on **decode** (the expert stream dominates there).
+
+## 2. Measured on this box
+
+Build: both backends work (CUDA is primary; Vulkan is the fallback).
+
+- **CUDA**: `make -C c inkling CUDA=1 CUDA_HOME=/opt/cuda` — CUDA 13.4/13.5, GCC 16.2.1.
+- **Vulkan**: `make -C c inkling VK=1`.
+
+### 2.1 8K / 32K / 64K / 250K after this work
+
+CUDA, `COLI_CUDA=1`, dense chain on (default for Inkling-2-Mini), 32 generated tokens
+(250K: 24), `OMP_NUM_THREADS=6`. Attention is the tiled kernel (§4.3) unless noted.
+
+| Context | Prompt tokens | KV | Prefill | Prefill tok/s | Decode | attn phase | expert phase | RSS | host KV | device |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8K  | 8,027   | f32 | 31.1 s  | 258 | 21.70 tok/s | 8.7 s  | 17.0 s | 9.7 GB | 824 MiB | 1133 MiB |
+| 8K  | 8,027   | f16 | 31.2 s  | 257 | 17.72 tok/s | 8.7 s  | 18.3 s | 9.3 GB | 412 MiB | 721 MiB |
+| 8K  | 8,027   | q4  | 29.9 s  | 268 | 22.15 tok/s | 8.5 s  | 16.1 s | 8.4 GB | 129 MiB | 438 MiB |
+| 32K | 32,100  | f32 | 161.1 s | 199 | 17.79 tok/s | — | — | 11.4 GB | — | — |
+| 32K | 32,100  | q4  | 151.5 s | 212 | 16.91 tok/s | — | — | 9.2 GB | — | — |
+| 64K | 63,977  | q4  | **387.1 s** | 165 | **14.94 tok/s** | **202.6 s** | 138.9 s | 10.2 GB | 675 MiB | 984 MiB |
+| 250K| 250,156 | q4  | **3651.5 s (60.9 min)** | 68.5 | **8.44 tok/s** | 2706.7 s | 769.4 s | 12.2 GB | 2493 MiB | 2802 MiB |
+
+`fill`/`other` are the rest (4–5 s and 45–173 s respectively; `other` is prefix-store and
+host-side row work). 250K: 13,156 frames; q4 host KV "full cache would be 14,659 MiB" (all 48
+state layers at `max_t`), the ring cache is 2493 MiB.
+
+### 2.2 Before / after (same prompt, same box)
+
+| 64K, 63,977 tokens | Prefill | attn | expert | Decode |
+|---|---:|---:|---:|---:|
+| before (fp32 KV, old kernel) | 1,009.4 s | 736.8 s | 235.5 s | 14.16 tok/s |
+| after, q4 KV, scalar kernel (`COLI_CUDA_RELATTN_QT=0`) | 671.8 s | 491.5 s | 135.8 s | 13.85 tok/s |
+| **after, q4 KV, tiled kernel** | **387.1 s** | **202.6 s** | 138.9 s | **14.94 tok/s** |
+| Unsloth b12588 (llama.cpp, q4 KV, DSpark) | 439.8 s | — | — | 18.33 tok/s |
+
+- Attention: **3.64× faster** than the old kernel at 64K; the tiled kernel alone is **2.43×**
+  faster than the scalar one on the same binary.
+- **64K prefill: Colibri 387.1 s vs Unsloth 439.8 s → 1.14× faster.** Decode is still 1.23×
+  slower (14.94 vs 18.33 tok/s), which is the expert stream and the per-layer host round
+  trips, not the KV.
+- 8K prefill went from 50.1 s to 29.9–31.1 s with the same prompt and 32 tokens.
+
+### 2.3 Quality / parity evidence
+
+- `c/tests/test_ink_kv.c`: f32 exact; f16 exact where representable and within 1e-3
+  elsewhere; q8/q4 within half a block step; the dot and the V axpy equal those of the
+  widened row. `ink_kv: ok`.
+- `make -C c cuda-inkc-check`: **all passed**, including the tiled kernel against the CPU
+  reference (rel. err ≤ 2e-5) and the typed mirrors f16/q8/q4 through both the scalar and the
+  tiled kernel (the kernel's dequantization equals `ink_kv_get`'s).
+- Teacher-forced argmax over a 56-token sequence, CPU experts, `OMP_NUM_THREADS=1`:
+  f32 / f16 / q8 / q4 agree **56/56** positions (`INK_TF_DUMP`).
+  Note: on this box a *greedy* run is not bit-reproducible with several OpenMP threads and
+  the expert tier (the tier hands different experts to the device per run, and the device and
+  the CPU round differently). Token-level comparisons must pin `OMP_NUM_THREADS=1` and
+  `COLI_CUDA=0`; that is why the parity above is measured that way.
+
+## 3. The KV budget (with the new types)
+
+Inkling 2 Mini has 48 state layers: 24 physical plus 24 loop-pass slots. Eight are global
+attention (layers 5, 11x3, 17x3, 23); the other 40 are sliding-window rings of 1024 tokens.
+The global slots dominate long context. Per token per global slot: `2 * 8 KV heads * 128 =
+2048` values. A row is `hd` values of one KV head at one position.
+
+| KV type | Bytes a row (hd=128) | Per token, 8 global slots | 64K | 250K |
+|---|---:|---:|---:|---:|
+| fp32 | 512 | 64 KB | 4.10 GB | 16.0 GB |
+| f16  | 256 | 32 KB | 2.05 GB | 8.00 GB |
+| q8   | 144 (4×(4+32)) | 18 KB | 1.12 GB | 4.38 GB |
+| q4   | 80 (4×(4+16))  | 10 KB | 0.62 GB | 2.44 GB |
+
+Measured ring caches (48 state layers, sliding rings at 1024): 8K f32 824 MiB / f16 412 / q4
+129; 64K q4 675 MiB; 250K q4 2493 MiB. The rings are ~0.17 GB f32 and constant; conv banks
+~4 MB; dense ~1.4 GB.
+
+### 3.1 Codec (`c/ink_kv.h`, new)
+
+A row is blocks of 32 values, each with its own **f32 scale** (not f16: `amax/7` can exceed
+65504, and a saturated scale silently destroyed the first test iteration):
+
+- f16: `kv16.h`'s IEEE half.
+- q8: `[f32 scale][32 int8]`, scale = amax/127.
+- q4: `[f32 scale][16 bytes, two two's-complement nibbles]`, scale = amax/7.
+
+`ink_kv_put/get/dot/axpy` are the only row accessors; the f32 path is the old
+`dot_f32_lanes`/`fmaf` loop, so an f32 run is bit-for-bit what it was. A row is
+self-describing, so the prefix store, park and the chain mirror copy rows as bytes given
+`ink_kv_row_bytes()`.
+
+## 4. Stage 1 — what was implemented
+
+### 4.1 Host cache
+
+- `INK2_KV = f32 | f16 | q8 | q4` (default f32), read once by `ink_kv_env()`; a misspelt value
+  exits rather than guessing.
+- `Model.kv_type` and `InkSeq.kv_type`; `kv_alloc` sizes every layer's rows by type (and keeps
+  the grow-in-place copy in row units); `attention()` and `ink2_attention()` read and write
+  through `ink_kv_*` (scores through `ink_kv_dot`, V through `ink_kv_axpy`).
+- Prefix store, `park.h`, the MTP draft verify's ring snapshot and the 250K/1M fit checks all
+  moved to row bytes. Segment sessions keep f32 (`model->kv_type = 0`).
+
+### 4.2 CUDA chain mirror
+
+- `ink2cc_mirror` allocates `KV * cap * ink_kv_row_bytes(type, hd)` a side, so the mirror is
+  q4 at 250K (2.3 GB) instead of fp32 (16 GB). Device usage at 250K: **2802 MiB** including
+  the dense matrices and scratch.
+- `push_state` uploads rows by bytes (`cc_write`'s offsets are in 4-byte units — the row bytes
+  are divided by 4; a row not divisible by 4 is refused).
+- For f32 the frame still copies the step's rows into the mirror as before. For a typed cache
+  the host quantizes them in `ink2cc_kv_down` and marks them (`dlo/dhi`); the next chunk's
+  `push_state` uploads them. Within a chunk the attention reads the step's rows from `kvs`
+  (f32 scratch), so nothing reads the mirror stale.
+- `CcRelAttn` gained `kv_type` and `k_rowb`; `ccg_kv_at`/`ccg_kv_row` in `cuda_inkc.cuh` read a
+  typed row, and the f32 case keeps the original vectorizable loop.
+- The Vulkan chains (`inkling2_chain.h`, `inkling_chain.h`) decline a typed host cache with a
+  message and the per-matrix path (which reads the typed rows on the CPU) takes the run.
+
+### 4.3 Prefill attention: the tiled kernel (`ccg_relattn_qt_k`)
+
+The old kernel launches a block per `(query head, query row)`; each of them walks the whole
+cache, so a 1024-row prompt chunk reads every K/V row 1024 times per head. The new kernel:
+
+- one block per `(KV head, tile of 8 query rows)`, 256 threads (8 warps), one warp a row;
+- the block loads a 32-position tile of K and V once into shared memory (K rows padded to
+  `hd+4` floats: a stride of 128 floats puts every lane's `float4` in the same bank);
+- each lane is one position of the tile and scores all of the KV head's query heads (float4
+  dots against the block's Q tile in shared, broadcast), with the same relative bias, tau,
+  sink, window and ring split between the mirror and `kvs` as the scalar kernel;
+- the online softmax keeps `m`, `l` and the V accumulator per head, and **rescales the
+  accumulator** whenever a later tile raises the max (`acc *= exp(m_old - m_new)`; missing
+  this was the one bug the A/B test caught);
+- V is accumulated by all 32 lanes (4 dims each) from the shared tile.
+- Dispatch: `S >= 8` and `hd <= 128` (and the shared tile ≤ 96 KiB);
+  `COLI_CUDA_RELATTN_QT=0` restores the old kernel, `=N` moves the threshold.
+
+Decode (`S = 1`) keeps the scalar kernel, which now reads typed rows.
+
+## 5. 250K MVP result
+
+Command:
+
+```bash
+SNAP=.../iq3xxs.colibri CTX_MAX=262144 INK2_KV=q4 COLI_CUDA=1 OMP_NUM_THREADS=6 \
+  ./c/inkling -f bench/prompt-250k.txt -n 24
+```
+
+- 250,156 prompt tokens; **prefill 3651.5 s (60.9 min)**; **decode 8.44 tok/s** (24 tokens);
+  wall 3666 s.
+- RSS **12.2 GB** of 23 GB; host KV 2493 MiB; device 2802 MiB of 12 GB. No OOM, no swap.
+- Phase split: attention 2706.7 s, routed experts 769.4 s, other 172.9 s.
+- Attention scales as expected from 64K (202.6 s × (250/64)² ≈ 3090 s), so the long-context
+  path is behaving; the cost is plain O(S²) fp32 attention.
+
+## 6. The 250K needle: not passing, with a concrete blocker
+
+The prompt is 1.15 MB of natural-ish prose with the fact
+`The secret access code for the vault is 7X4Q-ALPHA-93` at ~240K tokens and the question at
+the end. The engine answered with unrelated text, and the code is absent.
+
+The same harness at **943 tokens** also fails (also at 2K/4K/8K/16K), and a one-sentence
+version ("The secret access code is 4821. Question: what is the secret access code? Answer:")
+produces unrelated tokens too, while "Question: What is the capital of France? Answer:" gives
+"Paris". The chat template (`--chat`, with and without `THINK=0/1/2`, 200 tokens) also
+degenerates: this IQ3_XXS Mini snapshot, prompted through the engine's template, rambles in
+`<|content_thinking|>` instead of answering.
+
+So the KV path, the 250K context and the numerics are not what fails here: the model's
+instruction-following for this harness is. What to try next, in order:
+
+1. a correct chat/thinking prelude for this checkpoint (the template in `c/inkling.c` may be
+   missing the model's `thinking` system block or the right effort string);
+2. a less quantized snapshot (Q4_K_M is on disk) to separate quantization from prompting;
+3. an oracle-based check that does not need instruction-following: teacher-forced argmax of a
+   natural 32K/128K continuation, f32 vs q4 (`INK_TF_DUMP`), with a tokenizer dump added to
+   the engine (a `INK_IDS_DUMP` knob) so the reference ids are the real ones.
+
+## 7. Stage 2 — q8/q4 for 1M
+
+### 7.1 Why q4, not f16
+
+At 1M, f16 global KV is 32 GB and q8 is 17.4 GB; neither fits beside the model and OS on 23 GB.
+q4 is 9.2 GB: with 1.4 GB dense and ~8 GB OS that is ~18.6 GB, leaving ~4.4 GB for runtime and a
+small expert cache. q4 is the only viable 1M format on this host.
+
+### 7.2 Device policy at 1M
+
+A full q4 device mirror (9.2 GB) plus the 8 GiB tier does not fit 12 GB. Options, in order:
+
+1. **Host-only attention at 1M** (`COLI_VK_CHAIN=0` for Vulkan, or `COLI_CUDA_CHAIN=0`): KV
+   stays in RAM, the chain's dense work runs per layer. Decode is slower but memory-safe; the
+   CPU attention reads the typed rows.
+2. **Paged mirror:** keep a recent/hot block of KV rows on the device and stream the rest per
+   layer. Full attention reads every row, so this is bandwidth-bound; measure before
+   committing.
+3. **Larger card:** 24 GB makes a q4 mirror plus a ~10 GB tier comfortable; document as the
+   recommended 1M configuration.
+
+### 7.3 1M acceptance
+
+- Loads at `CTX_MAX=1048576` with q4 host KV and no OOM.
+- Needle retrieval at ~1M (once §6 is solved); no context corruption.
+- Decode recorded honestly; expect a few tok/s, not the 8K rate.
+- Quality gate vs f32 at 32K on code, JSON, and retrieval.
+- If the 12 GB path cannot pass, document 24 GB as the 1M minimum and keep the code path.
+
+## 8. Code map
+
+| File | Change |
+|---|---|
+| `c/ink_kv.h` (new) | `INK_KV_F32/F16/Q8/Q4`, `ink_kv_row_bytes/name/parse`, `ink_kv_put/get/dot/axpy` (f32 + `kv16.h` + 32-value q8/q4 blocks with f32 scales). |
+| `c/inkling.c` | `Model.kv_type`, `InkSeq.kv_type`; `ink_kv_env()` (`INK2_KV`); `kv_alloc` typed sizes + grow; `attention()` typed rows; park/prefix store/MTP/`ink_kv_later`/plan bytes in row units; segment sessions stay f32; `INK_TF_DUMP` for parity tests. |
+| `c/inkling2.h` | `ink2_attention()` typed rows (scores and V). |
+| `c/inkling2_cuchain.h` | typed mirror allocation; `push_state` uploads rows in 4-byte units; `kv_down` quantizes into the host cache and marks rows for the next push; `relattn` gets `kv_type`/`k_rowb`; plan bytes. |
+| `c/cuda_chain.h` | `CcRelAttn` gains `kv_type`, `k_rowb` (byte offsets for typed rows). |
+| `c/cuda_inkc.cuh` | `ccg_kv_at`/`ccg_kv_row` typed reads (f32 keeps its original loop); `ccg_relattn_qt_k` tiled prompt kernel with the online-softmax accumulator rescale; dispatch + `COLI_CUDA_RELATTN_QT`. |
+| `c/inkling2_chain.h`, `c/inkling_chain.h` | the Vulkan chains decline a typed host cache; per-matrix path takes it. |
+| `c/inkling2_mtp.h` | draft-verify ring snapshot in row bytes. |
+| `c/tests/test_ink_kv.c` (new) | round trip, error bounds, dot/axpy for f16/q8/q4. |
+| `c/tests/test_cuda_inkc.cu` | typed mirrors through the scalar and tiled kernels; tiled vs scalar A/B; the rescale regression cases. |
+| `PLAN-colibri.md` | this file. |
+
+## 9. Environment
+
+| Env | Default | Meaning |
+|---|---|---|
+| `INK2_KV` | `f32` | Host KV element type: `f32`, `f16`, `q8`, `q4`. The chain mirror uses the same type. q4 is the 250K/1M setting. |
+| `COLI_CUDA_RELATTN_QT` | `8` | Rows from which the tiled prefill kernel runs; `0` = the per-(head,row) kernel; `>1` = the row-tile size threshold. |
+| `CTX_MAX` | `8192` | Served context bound (KV planning and refusal). |
+| `COLI_CUDA` / `COLI_CUDA_CHAIN` / `COLI_VK_CHAIN` | on / on / off | As before; a typed KV disables the Vulkan chains only. |
+
+## 10. Validation
+
+1. **Round trip:** `c/tests/test_ink_kv.c` — all pass.
+2. **Kernels:** `make -C c cuda-inkc-check` — all pass (typed mirrors, tiled vs scalar, CPU
+   reference).
+3. **Oracle:** teacher-forced argmax 56/56 across f32/f16/q8/q4 (CPU, 1 thread).
+4. **Long context:** 8K/32K/64K/250K prefill and decode measured above.
+5. **Memory:** RSS, `[kv]`, and device bytes recorded for every run.
+6. **Agent (still to do):** tool-call round trip and prefix reuse at 64K+ with `INK2_KV=q4`.
+
+## 11. Remaining work
+
+| Area | Next step |
+|---|---|
+| Decode speed | 14.94 tok/s at 64K vs Unsloth 18.33: the chain still round-trips the host every layer (1923 frames at 64K). Keep more layers' experts in the frame (`COLI_CUDA_CHAIN_MOE`), batch the host's expert step, and fuse the gate into the attention kernel. |
+| Attention at 250K | 2706 s: the next step is bf16 tensor cores (`mma.m16n8k16`) for QK^T and AV in the tiled kernel, 16 query rows a block, and an f16 mirror on the device. Target ~2–3× more. |
+| Needle harness | §6: chat/thinking prelude or a less quantized snapshot; an `INK_IDS_DUMP` knob for a long-context teacher-forced oracle. |
+| 1M | q4 host KV, host-side attention (`COLI_CUDA_CHAIN=0`), tier reduced; measure and document the 24 GB recommendation. |
+| Upstream | the KV type and the tiled kernel behind `INK2_KV` / `COLI_CUDA_RELATTN_QT` with docs and tests. |
+
+## 12. Risks
+
+| Risk | Mitigation |
+|---|---|
+| q4 KV changes near-tie tokens | q8/f16 are one env var away; parity is measured on the CPU path; keep q8 K if quality needs it. |
+| Typed mirror row not 4-byte aligned | `push_state` refuses with a message (only widths that cannot occur: heads are multiples of 32 in this family). |
+| Device mirror too large at 250K | q4 mirror (measured 2802 MiB total at 250K); otherwise `COLI_CUDA_CHAIN=0` and the CPU attention. |
+| Prefix store / park type mismatch | rows are byte-copied and self-describing, so a store written under one type is read by that type; the type is fixed per run. |
+| 1M decode is very slow | host-side q4 KV; document; 24 GB for a device mirror. |
+| MTP verify over quantized KV | the snapshot is row-based (`inkling2_mtp.h`), tested by the existing cases; run with `INK2_MTP=1` before trusting it. |
+| Non-reproducible greedy runs | documented above: the tier's device/CPU split changes the numerics; parity runs use 1 thread and `COLI_CUDA=0`. |
+| 23 GB RAM | q4/q8, smaller expert cache, OS headroom; measured 12.2 GB at 250K with q4. |
+
+## 13. Milestones
+
+- **M0** — Build dev + import IQ3; benchmark 8K/32K/64K. *Done.*
+- **M1** — f16 host KV + typed device mirror; 250K load and needle. *Fit and load done; needle
+  blocked on the model/prompt (§6).*
+- **M2** — f16/q8/q4 host KV; quality/perf; 64K vs Unsloth. *Done: 64K prefill 387.1 s vs
+  439.8 s; decode 14.94 vs 18.33 tok/s.*
+- **M3** — 1M acceptance or documented 24 GB requirement. *Open.*
+- **M4** — Upstream the KV type and the tiled kernel behind env flags with docs/tests. *Open.*
+
+## Appendix — benchmark commands
+
+```bash
+# build (CUDA primary; Vulkan fallback is `VK=1`)
+make -C c inkling CUDA=1 CUDA_HOME=/opt/cuda
+
+# tests
+cc -O2 -march=native -I c c/tests/test_ink_kv.c -lm -o /tmp/test_ink_kv && /tmp/test_ink_kv
+make -C c cuda-inkc-check CUDA=1 CUDA_HOME=/opt/cuda
+
+# import
+./c/coli import /path/Inkling-2-Mini-UD-IQ3_XXS.gguf \
+  --out /path/iq3xxs.colibri --no-mtp
+
+# run (long prompts via -f; the local getline patch keeps one line whole)
+SNAP=/path/iq3xxs.colibri CTX_MAX=70000 INK2_KV=q4 COLI_CUDA=1 \
+  ./c/inkling -f bench/prompt-64k.txt -n 32
+
+# 250K
+SNAP=/path/iq3xxs.colibri CTX_MAX=262144 INK2_KV=q4 COLI_CUDA=1 \
+  ./c/inkling -f bench/prompt-250k.txt -n 24
+
+# A/B the attention kernel (0 = the per-(head,row) kernel)
+COLI_CUDA_RELATTN_QT=0 SNAP=... CTX_MAX=70000 INK2_KV=q4 ./c/inkling -f bench/prompt-64k.txt -n 32
+```
+
+`bench/run_bench.py` runs 8K/32K/64K and writes `bench/results.json`;
+`bench/unsloth_64k.py` is the llama.cpp baseline; `bench/results-kv.json` holds the runs in
+§2.1 (q4/f16 8K, 32K/64K q4, 64K scalar A/B, 250K) with their logs under
+`/var/tmp/scratch/kvtest/` on this box.

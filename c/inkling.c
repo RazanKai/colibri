@@ -44,6 +44,7 @@
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"
+#include "ink_kv.h"  /* the host KV cache's element type: INK2_KV=f16/q8/q4 (ink_kv.h) */
 #include "park.h"   /* a short request keeps the conversation aside (COLI_PARK) */
 #include "prompt_break.h"   /* a served prompt that a CANCEL stops between two layers */
 #include "pin_pool.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
@@ -222,7 +223,7 @@ typedef struct {
  * stands and the record of the tokens it holds. The Model holds the conversation a
  * prefill runs on (ink_seq_swap trades it for a parked one); a multiplexed decode
  * step parks them all and reads each row's from its InkRow. */
-typedef struct { float **K, **V; float **cs[4]; int kv_len; kv_prefix kvp; } InkSeq;
+typedef struct { float **K, **V; int kv_type; float **cs[4]; int kv_len; kv_prefix kvp; } InkSeq;
 typedef struct { InkSeq *seq; int pos; } InkRow;
 static int g_ink_mux_slots = 1;   /* KV_SLOTS: the conversations a serve decodes at once */
 
@@ -264,7 +265,8 @@ typedef struct {
     uint64_t clock, hits, miss;
     uint64_t ereq, euse;                  /* routed richiesti (topk) vs usati dopo TOPP */
     double t_fill, t_expert, t_shared, t_attn, t_route;   /* phase timers */
-    float **K, **V; int kv_len, max_t;    /* per-layer [kv][kv_ring_rows][hd]; sliding layers are a t%window ring */
+    float **K, **V; int kv_type;          /* rows of kv_type (ink_kv.h); f32 unless INK2_KV says otherwise */
+    int kv_len, max_t;                    /* per-layer [kv][kv_ring_rows][hd]; sliding layers are a t%window ring */
     float **cs[4];                        /* conv states, [n_layers][C*(K-1)] */
     double dense_load_s;
     /* KV prefix reuse: what the current K/V and conv states were built from.
@@ -2401,6 +2403,31 @@ static inline int kv_ring_rows(const Cfg *c, int li, int max_t) {
     return (c->local[li] && c->window > 0 && c->window < max_t) ? c->window : max_t;
 }
 
+/* The host KV cache's element type (ink_kv.h): INK2_KV, read once. f32 unless the run
+ * asked for f16/q8/q4; a misspelt value is refused, not guessed. */
+static int g_ink_kv_type = -1;
+static int ink_kv_env(void) {
+    if (g_ink_kv_type < 0) {
+        const char *e = getenv("INK2_KV");
+        int t = ink_kv_parse(e);
+        if (t < 0) {
+            fprintf(stderr, "[kv] INK2_KV=%s is not f32, f16, q8 or q4\n", e);
+            exit(2);
+        }
+        g_ink_kv_type = t;
+    }
+    return g_ink_kv_type;
+}
+/* one row of layer i, in bytes; the row of a KV head at one position */
+static inline size_t ink_kv_row(const Model *m, int i) {
+    return ink_kv_row_bytes(m->kv_type, L_HD(&m->c, i));
+}
+/* the row pointer of (kv head h, position row) in layer i's cache: heads are laid out
+ * one after another, each with `cap` rows (the ring's rows on a sliding layer) */
+static inline void *ink_kv_at(void *base, size_t row_bytes, int cap, int h, int row) {
+    return (char *)base + ((size_t)h * (size_t)cap + (size_t)row) * row_bytes;
+}
+
 /* A short convolution over S rows: in a multiplexed step each row is the next input
  * of its own conversation's bank (sconv_apply over that one row), else the rows are a
  * sequence through the Model's bank. */
@@ -2443,6 +2470,7 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
      * holds exactly what the cache would (post-sconv, post-rmsnorm), so the
      * arithmetic is unchanged; the cache is appended after scoring. */
     int win = kv_ring_rows(c, li, m->max_t);
+    const size_t krb = ink_kv_row(m, li), ktype = (size_t)m->kv_type;
     float scale = 1.f / (float)hd;
     float *ctx = falloc((int64_t)S*qdim);
     #pragma omp parallel
@@ -2472,12 +2500,12 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                     if (en > 1.0) tau = 1.f + c->log_alpha * (float)log(en);
                 }
                 const float *qv = q + (int64_t)s*qdim + h*hd;
-                const float *Kh = Kc[li] + ((int64_t)(h/group)*win)*hd;
                 const float *Kb = k  + srow + (int64_t)(h/group)*hd;
+                void *Kbase = Kc[li];
                 for (int t = t0; t <= qpos; t++) {
-                    const float *kv = t < tb ? Kh + (int64_t)(t % win)*hd
-                                             : Kb + (int64_t)(t - sp0)*kvdim;
-                    float acc = dot_f32_lanes(qv, kv, hd);
+                    float acc = t < tb
+                        ? ink_kv_dot((int)ktype, qv, ink_kv_at(Kbase, krb, win, h/group, t % win), hd)
+                        : dot_f32_lanes(qv, Kb + (int64_t)(t - sp0)*kvdim, hd);
                     int dist = qpos - t;
                     sc[t - t0] = tau * (acc*scale + (dist < ext ? rl[dist] : 0.f));
                 }
@@ -2485,13 +2513,12 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
                 softmax_row(sc, n);
                 float *cx = ctx + (int64_t)s*qdim + h*hd;
                 for (int d = 0; d < hd; d++) cx[d] = 0.f;
-                const float *Vh = Vc[li] + ((int64_t)(h/group)*win)*hd;
                 const float *Vb = vv + srow + (int64_t)(h/group)*hd;
+                void *Vbase = Vc[li];
                 for (int t = t0; t <= qpos; t++) {
-                    const float *vrow = t < tb ? Vh + (int64_t)(t % win)*hd
-                                               : Vb + (int64_t)(t - sp0)*kvdim;
                     float a = sc[t - t0];
-                    for (int d = 0; d < hd; d++) cx[d] += a * vrow[d];
+                    if (t < tb) ink_kv_axpy((int)ktype, cx, a, ink_kv_at(Vbase, krb, win, h/group, t % win), hd);
+                    else for (int d = 0; d < hd; d++) cx[d] += a * Vb[(int64_t)(t - sp0)*kvdim + d];
                 }
             }
         }
@@ -2502,9 +2529,9 @@ static void attention(Model *m, Layer *l, int li, float *x, int S, int pos0, flo
     int s0 = !mr && S - win > 0 ? S - win : 0;   /* a multiplexed step: every row to its own cache */
     for (int s = s0; s < S; s++) for (int h = 0; h < KV; h++) {
         int t = mr ? mr[s].pos : pos0 + s;
-        float *Kd = mr ? mr[s].seq->K[li] : m->K[li], *Vd = mr ? mr[s].seq->V[li] : m->V[li];
-        memcpy(Kd + ((int64_t)h*win + t % win)*hd, k  + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
-        memcpy(Vd + ((int64_t)h*win + t % win)*hd, vv + (int64_t)s*kvdim + h*hd, hd*sizeof(float));
+        void *Kd = mr ? mr[s].seq->K[li] : m->K[li], *Vd = mr ? mr[s].seq->V[li] : m->V[li];
+        ink_kv_put((int)ktype, ink_kv_at(Kd, krb, win, h, t % win), k  + (int64_t)s*kvdim + h*hd, hd);
+        ink_kv_put((int)ktype, ink_kv_at(Vd, krb, win, h, t % win), vv + (int64_t)s*kvdim + h*hd, hd);
     }
     matmul_w(out, ctx, l->o, S, qdim, D);
     free(q); free(k); free(vv); free(rr); free(ctx);
@@ -2809,8 +2836,9 @@ static size_t ink_kv_later(const Model *m) {
     const Cfg *c = &m->c;
     int t = ink_ctx_max() + 8;
     size_t b = 0;
+    const int kt = ink_kv_env();
     for (int i = 0; i < c->n_state; i++)   /* the loop's later passes keep their own (Inkling-2-Mini) */
-        b += 2 * (size_t)L_KV(c, i) * (size_t)kv_ring_rows(c, i, t) * (size_t)L_HD(c, i) * sizeof(float);
+        b += 2 * (size_t)L_KV(c, i) * (size_t)kv_ring_rows(c, i, t) * ink_kv_row_bytes(kt, L_HD(c, i));
     return b * (size_t)(g_ink_mux_slots > 1 ? g_ink_mux_slots : 1);
 }
 static size_t ink_ps_plan(void);   /* the prefix store's budget (prefix_store.h), planned with the RAM */
@@ -3913,12 +3941,15 @@ static void ink_seq_alloc(Model *m, InkSeq *q) {
     Cfg *c = &m->c;
     memset(q, 0, sizeof *q);
     q->K = calloc(c->n_state, sizeof(float*)); q->V = calloc(c->n_state, sizeof(float*));
+    q->kv_type = m->kv_type;
     for (int j = 0; j < 4; j++) q->cs[j] = calloc(c->n_state, sizeof(float*));
     for (int i = 0; i < c->n_state; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i);
+        const size_t rb = ink_kv_row_bytes(m->kv_type, hd);
         int64_t rows = kv_ring_rows(c, i, m->max_t);
-        q->K[i] = falloc((int64_t)kv * rows * hd);
-        q->V[i] = falloc((int64_t)kv * rows * hd);
+        q->K[i] = malloc((size_t)kv * (size_t)rows * rb);
+        q->V[i] = malloc((size_t)kv * (size_t)rows * rb);
+        if (!q->K[i] || !q->V[i]) { fprintf(stderr, "OOM: a KV slot\n"); exit(1); }
         for (int j = 0; j < 4; j++)
             if (m->cs[j][i]) q->cs[j][i] = calloc((size_t)ink_cs_cells(c, j, i), sizeof(float));
     }
@@ -4004,35 +4035,38 @@ static void kv_alloc(Model *m, int max_t) {
     float **oldK = m->K, **oldV = m->V;
     int old_max = m->max_t;
     int keep = (m->K && m->kv_len > 0 && m->kv_len <= max_t) ? m->kv_len : 0;
+    if (!oldK) m->kv_type = ink_kv_env();   /* the run's element type, once */
 
     m->max_t = max_t;
     m->K = calloc(c->n_state, sizeof(float*)); m->V = calloc(c->n_state, sizeof(float*));
     int64_t ring = 0, full = 0;
     for (int i = 0; i < c->n_state; i++) {
         int kv = L_KV(c,i), hd = L_HD(c,i);
+        const size_t rb = ink_kv_row_bytes(m->kv_type, hd);
         int64_t rows     = kv_ring_rows(c, i, max_t);
         int64_t old_rows = oldK ? kv_ring_rows(c, i, old_max) : 0;
         if (oldK && rows == old_rows) {
             m->K[i] = oldK[i]; m->V[i] = oldV[i];
             oldK[i] = NULL;    oldV[i] = NULL;
         } else {
-            m->K[i] = falloc((int64_t)kv * rows * hd);
-            m->V[i] = falloc((int64_t)kv * rows * hd);
+            m->K[i] = malloc((size_t)kv * (size_t)rows * rb);
+            m->V[i] = malloc((size_t)kv * (size_t)rows * rb);
+            if (!m->K[i] || !m->V[i]) { fprintf(stderr, "OOM: the KV cache\n"); exit(1); }
             for (int h = 0; h < kv && keep; h++) {
-                memcpy(m->K[i] + (int64_t)h * rows * hd,
-                       oldK[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
-                memcpy(m->V[i] + (int64_t)h * rows * hd,
-                       oldV[i] + (int64_t)h * old_max * hd, (size_t)keep * hd * sizeof(float));
+                memcpy((char *)m->K[i] + (size_t)h * (size_t)rows * rb,
+                       (char *)oldK[i] + (size_t)h * (size_t)old_rows * rb, (size_t)keep * rb);
+                memcpy((char *)m->V[i] + (size_t)h * (size_t)rows * rb,
+                       (char *)oldV[i] + (size_t)h * (size_t)old_rows * rb, (size_t)keep * rb);
             }
         }
-        ring += 2 * (int64_t)kv * rows  * hd * (int64_t)sizeof(float);
-        full += 2 * (int64_t)kv * max_t * hd * (int64_t)sizeof(float);
+        ring += 2 * (int64_t)kv * rows  * (int64_t)rb;
+        full += 2 * (int64_t)kv * max_t * (int64_t)rb;
     }
     if (oldK) for (int i = 0; i < c->n_state; i++) { free(oldK[i]); free(oldV[i]); }
     free(oldK); free(oldV);
-    if (ring < full)
-        fprintf(stderr, "[kv] %.1f MiB (ring buffers on sliding layers; full cache would be %.1f MiB)\n",
-                ring/1048576.0, full/1048576.0);
+    if (ring < full || m->kv_type != INK_KV_F32)
+        fprintf(stderr, "[kv] %.1f MiB %s (ring buffers on sliding layers; full cache would be %.1f MiB)\n",
+                ring/1048576.0, ink_kv_name(m->kv_type), full/1048576.0);
 
     /* the record describes those same positions, so it survives with them --
      * unless its own allocation fails, in which case reuse simply stops. */
@@ -4427,8 +4461,8 @@ static ColiParkPart *ink_park_parts(Model *m, int *n_out) {
     ColiParkPart *p = malloc(sizeof *p * ((size_t)c->n_state * 6));
     if (!p) { *n_out = 0; return NULL; }
     for (int i = 0; i < c->n_state; i++) {
-        int kv = L_KV(c,i), hd = L_HD(c,i), rows = (int)kv_ring_rows(c, i, m->max_t);
-        size_t row = (size_t)hd * sizeof(float), hs = (size_t)rows * row;
+        int kv = L_KV(c,i), rows = (int)kv_ring_rows(c, i, m->max_t);
+        size_t row = ink_kv_row(m, i), hs = (size_t)rows * row;
         p[n++] = coli_park_heads(m->K ? m->K[i] : NULL, row, rows, kv, hs);
         p[n++] = coli_park_heads(m->V ? m->V[i] : NULL, row, rows, kv, hs);
         for (int j = 0; j < 4; j++) p[n++] = coli_park_whole(m->cs[j][i], (size_t)ink_cs_cells(c, j, i) * sizeof(float));
@@ -4499,8 +4533,8 @@ static int ink_ps_parts(Model *m, ColiPsPart *parts) {
     for (int i = 0; i < c->n_state; i++) {
         const int rows = kv_ring_rows(c, i, m->max_t);
         if (!m->K || !m->V || rows != m->max_t) continue;   /* a ring: the checkpoint's */
-        const int kv = L_KV(c, i), hd = L_HD(c, i);
-        const size_t row = (size_t)hd * sizeof(float), hs = (size_t)rows * row;
+        const int kv = L_KV(c, i);
+        const size_t row = ink_kv_row(m, i), hs = (size_t)rows * row;
         parts[n++] = (ColiPsPart){m->K[i], row, rows, kv, hs, 1};
         parts[n++] = (ColiPsPart){m->V[i], row, rows, kv, hs, 1};
     }
@@ -4527,7 +4561,7 @@ static InkPsState *ink_ps_state_save(Model *m, size_t *bytes) {
         *bytes += (size_t)ink_cs_cells(c, 0, i) * 2 * sizeof(float) + (size_t)ink_cs_cells(c, 2, i) * 2 * sizeof(float);
         const int rows = kv_ring_rows(c, i, m->max_t);
         if (rows == m->max_t) continue;
-        const size_t rb = (size_t)L_KV(c, i) * rows * L_HD(c, i) * sizeof(float);
+        const size_t rb = (size_t)L_KV(c, i) * (size_t)rows * ink_kv_row(m, i);
         ok = (x->rk[i] = (float *)malloc(rb)) && (x->rv[i] = (float *)malloc(rb));
         if (!ok) break;
         memcpy(x->rk[i], m->K[i], rb); memcpy(x->rv[i], m->V[i], rb);
@@ -4569,7 +4603,7 @@ static int ink_ps_take(Model *m, const int *ids, int np, int held) {
     for (int i = 0; i < c->n_state; i++) {
         const int rows = kv_ring_rows(c, i, m->max_t);
         if (rows == m->max_t || !x->rk[i]) continue;
-        const size_t rb = (size_t)L_KV(c, i) * rows * L_HD(c, i) * sizeof(float);
+        const size_t rb = (size_t)L_KV(c, i) * (size_t)rows * ink_kv_row(m, i);
         memcpy(m->K[i], x->rk[i], rb); memcpy(m->V[i], x->rv[i], rb);
     }
     m->kv_len = P;
@@ -5363,14 +5397,17 @@ int main(int argc, char **argv) {
         }
         else {   /* -f: one prompt per line, model loaded once, usage accumulates */
             FILE *pf = fopen(pfile, "rb"); if (!pf) { perror(pfile); return 1; }
-            char ln[8192]; int np = 0;
-            while (fgets(ln, sizeof(ln), pf)) {
-                size_t n = strlen(ln); while (n && (ln[n-1]=='\n'||ln[n-1]=='\r')) ln[--n]=0;
+            /* getline, not fgets: a long-context prompt is one line, and the old 8 KiB
+             * buffer split it into many unrelated prompts. */
+            char *ln = NULL; size_t lncap = 0; long got; int np = 0;
+            while ((got = getline(&ln, &lncap, pf)) != -1) {
+                size_t n = (size_t)got; while (n && (ln[n-1]=='\n'||ln[n-1]=='\r')) ln[--n]=0;
                 if (!n || ln[0]=='#') continue;
                 printf("\n===== prompt %d =====\n", ++np);
                 state_reset(&m);
                 generate_stream(&m, &T, ln, n_new, NULL, 0);
             }
+            free(ln);
             fclose(pf);
         }
         int saved = usage_save(&m, snap);
@@ -5459,6 +5496,11 @@ int main(int argc, char **argv) {
         free(lg);
         int ok = 0; for (int i = 0; i < nfull; i++) ok += (tf[i] == tfref[i]);
         printf("teacher-forced argmax: %d/%d match\n", ok, nfull);
+        const char *tfd = getenv("INK_TF_DUMP");   /* tests: the per-position argmax, to compare runs */
+        if (tfd && *tfd) {
+            FILE *df = fopen(tfd, "wb");
+            if (df) { fwrite(tf, sizeof(int), (size_t)nfull, df); fclose(df); }
+        }
         free(tf);
         state_reset(&m);
     }

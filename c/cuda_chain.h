@@ -283,7 +283,12 @@ typedef struct { int mode, S, C, CK, x_off, x_row, w_off, ring_off, n; float fc;
 typedef struct { int S, H, KVH, hd, pos_base, cap, window, ext, d_rel;
                  int q_off, q_row, o_off, o_row, k_off, v_off, ks_off, vs_off, kv_row;
                  int r_off, r_row, relp_off, tau_off; float scale;
-                 int has_sink, sink_off; } CcRelAttn;
+                 int has_sink, sink_off;
+                 /* the mirror's element type (ink_kv.h's INK_KV_*): 0 f32 (k_off/v_off in
+                  * elements, as every f32 caller passes them), else the host cache's f16/q8/q4
+                  * rows (k_off/v_off in bytes, k_rowb bytes a row). The step's own rows in kvs
+                  * stay f32. */
+                 int kv_type, k_rowb; } CcRelAttn;
 typedef struct { int S, D, nb, x_off, x_row, b_off, b_row, w_off, y_off, y_row; float eps, scale; } CcInk2Mix;
 typedef struct { int nseg, n, per_row, x_off, x_row, has_w, w_off; float thr; } CcInk2Clip;
 typedef struct { int S, C, K, hd, x_off, x_row, d_off, d_row, st_off, ring_off; float fc; } CcInk2Dconv;

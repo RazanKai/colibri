@@ -460,6 +460,11 @@ static InkChain *inkc_setup_dev(Model *m, int d) {
     if (!ch && !(ch = inkc_new_dev(m, d))) return NULL;
     ch->tried = 1;
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, CK = c->conv_k, dr = c->d_rel;
+    if (ink_kv_env() != INK_KV_F32) {   /* the mirror reads f32 rows; the per-matrix path takes the type */
+        fprintf(stderr, "[VK] inkling chain: INK2_KV=%s needs a typed mirror this path does not have; per-matrix path\n",
+                ink_kv_name(ink_kv_env()));
+        return NULL;
+    }
     if (!inkc_geometry_ok(m, 1)) return NULL;
     if (!vkc_sconv_ready() || !vkc_relattn_ready()) {
         fprintf(stderr, "[VK] inkling chain: chain_sconv.spv or chain_relattn.spv is missing; per-matrix path\n");

@@ -203,6 +203,11 @@ static Ink2Chain *ink2c_setup(Model *m) {
     if (!ch && !(ch = ink2c_new(m))) return NULL;
     ch->tried = 1;
     Cfg *c = &m->c; int L = c->n_layers, D = c->hidden, CK = c->conv_k, dr = c->d_rel, E = c->n_experts;
+    if (ink_kv_env() != INK_KV_F32) {   /* the Vulkan mirror reads f32 rows; the per-matrix path takes the type */
+        fprintf(stderr, "[VK] inkling2 chain: INK2_KV=%s needs the CUDA chain's typed mirror; per-matrix path\n",
+                ink_kv_name(ink_kv_env()));
+        return NULL;
+    }
     if (!ink2c_geometry_ok(m, 1)) return NULL;
     if (!vkc_sconv_ready() || !vkc_relattn_ready() || !vkc_ink2_ready()) {
         fprintf(stderr, "[VK] inkling2 chain: chain_sconv.spv, chain_relattn.spv or chain_ink2.spv is missing; per-matrix path\n");

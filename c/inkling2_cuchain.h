@@ -109,11 +109,13 @@ static size_t ink2cc_plan_bytes(const Model *m) {
     const Cfg *c = &m->c;
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, K = (size_t)c->topk, b = 0, row = 0;
     int t = ink_ctx_max() + 8;
+    const int kt = ink_kv_env();                                       /* the host cache's row type */
     size_t kvm = 0;
     for (int v = 0; v < c->n_state; v++) { size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v); if (kvo > kvm) kvm = kvo; }
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */
         size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v);
-        b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 + 2 * kvo * (size_t)kv_ring_rows(c, v, t) * 4;
+        b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 +
+             2 * (size_t)L_KV(c, v) * (size_t)kv_ring_rows(c, v, t) * ink_kv_row_bytes(kt, L_HD(c, v));
     }
     if (c->loop_p > 1) {                                               /* the gates and the queries */
         size_t nl = (size_t)(c->loop_e - c->loop_s), r = (size_t)c->loop_r;
@@ -125,7 +127,7 @@ static size_t ink2cc_plan_bytes(const Model *m) {
         if (!c->local[i]) b += 2 * KV * CK * D * 4;                   /* the dynamic taps' projections */
         b += (6 * D + H * hd + H * c->d_rel + (size_t)c->d_rel * L_EXT(c, i) + 2 * kvo * CK + 2 * D * CK + E) * 4;
         b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2;                     /* the states and their read-back */
-        b += 2 * kvo * (size_t)kv_ring_rows(c, i, t) * 4;             /* the K/V mirror */
+        b += 2 * (size_t)KV * (size_t)kv_ring_rows(c, i, t) * ink_kv_row_bytes(kt, (int)hd);   /* the K/V mirror */
         size_t r1 = (14 * D + 3 * H * hd + 4 * kvo + H * c->d_rel + 2 * E + KV * CK + 2 * H) * 4;
         if (r1 > row) row = r1;
     }
@@ -385,8 +387,9 @@ static int ink2cc_mirror(Ink2CuChain *ch, Model *m) {
         int cap = kv_ring_rows(c, i, m->max_t), hd = L_HD(c, i), KV = L_KV(c, i);
         ch->cap[i] = cap;
         ch->dlo[i] = 0; ch->dhi[i] = cap < m->max_t ? m->max_t : m->kv_len;   /* a ring: every row; else the positions held */
-        ch->kc[i] = cc_buf((size_t)KV * cap * hd * sizeof(float), CC_DEV);
-        ch->vc[i] = cc_buf((size_t)KV * cap * hd * sizeof(float), CC_DEV);
+        const size_t rb = ink_kv_row_bytes(m->kv_type, hd);
+        ch->kc[i] = cc_buf((size_t)KV * (size_t)cap * rb, CC_DEV);
+        ch->vc[i] = cc_buf((size_t)KV * (size_t)cap * rb, CC_DEV);
         if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
     }
     ch->max_t = m->max_t; ch->hostK = m->K;
@@ -432,13 +435,16 @@ static int ink2cc_push_state(Ink2CuChain *ch, Model *m) {
     for (int i = 0; i < ch->NS && ok; i++) {
         if (ch->dlo[i] >= ch->dhi[i]) continue;
         int cap = ch->cap[i], hd = L_HD(c, i), KV = L_KV(c, i);
+        const size_t rb = ink_kv_row_bytes(m->kv_type, hd);   /* bytes a row; cc_write's offsets are in 4-byte units */
         int t0 = ch->dhi[i] - cap > ch->dlo[i] ? ch->dhi[i] - cap : ch->dlo[i];
+        if (rb & 3) { fprintf(stderr, "[CUDA] inkling2 chain: a %s row of %zu bytes is not 4-byte aligned\n", ink_kv_name(m->kv_type), rb); return 0; }
+        const size_t ru = rb / 4;
         for (int t = t0; t < ch->dhi[i] && ok; ) {        /* a run of rows up to the ring's end */
             int row = t % cap, run = ch->dhi[i] - t < cap - row ? ch->dhi[i] - t : cap - row;
             for (int h = 0; h < KV && ok; h++) {
-                size_t off = ((size_t)h * cap + row) * hd;
-                ok = cc_write(ch->kc[i], off, m->K[i] + off, (size_t)run * hd * sizeof(float)) &&
-                     cc_write(ch->vc[i], off, m->V[i] + off, (size_t)run * hd * sizeof(float));
+                size_t off = ((size_t)h * cap + row) * ru;
+                ok = cc_write(ch->kc[i], off, (char *)m->K[i] + off * 4, (size_t)run * rb) &&
+                     cc_write(ch->vc[i], off, (char *)m->V[i] + off * 4, (size_t)run * rb);
             }
             t += run;
         }
@@ -510,36 +516,44 @@ static int ink2cc_attention(Ink2CuChain *ch, Model *m, int i, int v, int sep, in
          cc_ink2_clip(ch->kvs, NULL, &kc) && cc_norm(ch->kvs, ch->prm, ch->kvs, &vn);
     CcRelAttn a = {n, H, KV, hd, pb, cap, local ? c->window : 0, L_EXT(c, i), dr,
                     0, H * hd, 0, H * hd, 0, 0, 0, (int)vs, kvo, 0, H * dr, (int)ch->o_relp[i], local ? R : 0,
-                    (float)(1.0 / sqrt((double)hd)), 1, 2 * R};
+                    (float)(1.0 / sqrt((double)hd)), 1, 2 * R,
+                    m->kv_type, (int)ink_kv_row_bytes(m->kv_type, hd)};
     CcEw gate = {CC_EW_SIGMUL, n * H * hd, H * hd, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
     ok = ok && cc_relattn(ch->q, ch->kc[v], ch->vc[v], ch->ctx, ch->kvs, ch->r, ch->prm, ch->ts, &a) &&
          cc_ew(ch->ctx, ch->ctx, ch->gt, NULL, NULL, &gate);
     if (!ok) return 0;
-    /* the step's rows into the cache after the attention read them: the last `cap` of them */
-    int s0 = n > cap ? n - cap : 0, nr = (n - s0) * KV;
-    CcRegion *rk = malloc(sizeof *rk * (size_t)nr * 2), *rv = rk ? rk + nr : NULL;
-    if (!rk) return 0;
-    for (int s = s0; s < n; s++) for (int h = 0; h < KV; h++) {
-        size_t dst = ((size_t)h * cap + (size_t)(pb + s) % cap) * hd, src = (size_t)s * kvo + (size_t)h * hd;
-        rk[(s - s0) * KV + h] = (CcRegion){dst, src, (size_t)hd};
-        rv[(s - s0) * KV + h] = (CcRegion){dst, vs + src, (size_t)hd};
+    /* the step's rows into the cache after the attention read them. An f32 cache takes them from
+     * kvs here; a typed one is written by the host (ink2cc_kv_down) and its next push uploads the
+     * rows it quantized -- within this chunk the attention reads them from kvs anyway. */
+    if (m->kv_type == INK_KV_F32) {
+        int s0 = n > cap ? n - cap : 0, nr = (n - s0) * KV;
+        CcRegion *rk = malloc(sizeof *rk * (size_t)nr * 2), *rv = rk ? rk + nr : NULL;
+        if (!rk) return 0;
+        for (int s = s0; s < n; s++) for (int h = 0; h < KV; h++) {
+            size_t dst = ((size_t)h * cap + (size_t)(pb + s) % cap) * hd, src = (size_t)s * kvo + (size_t)h * hd;
+            rk[(s - s0) * KV + h] = (CcRegion){dst, src, (size_t)hd};
+            rv[(s - s0) * KV + h] = (CcRegion){dst, vs + src, (size_t)hd};
+        }
+        ok = cc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && cc_copy_regions(ch->vc[v], ch->kvs, rv, nr);
+        free(rk);
     }
-    ok = cc_copy_regions(ch->kc[v], ch->kvs, rk, nr) && cc_copy_regions(ch->vc[v], ch->kvs, rv, nr) &&
-         cc_copy(kvdst, ko, ch->kvs, 0, (size_t)n * kvo) && cc_copy(kvdst, ko + vstride, ch->kvs, vs, (size_t)n * kvo);
-    free(rk);
-    return ok && cc_matmul(ch->t_o[i], ch->ctx, 0, ch->a, 0, n);
+    return ok && cc_copy(kvdst, ko, ch->kvs, 0, (size_t)n * kvo) &&
+           cc_copy(kvdst, ko + vstride, ch->kvs, vs, (size_t)n * kvo) &&
+           cc_matmul(ch->t_o[i], ch->ctx, 0, ch->a, 0, n);
 }
 /* state layer v's new K/V rows (kv: K, then V vstride floats on) into the host's cache, as
  * ink2_attention writes them */
 static void ink2cc_kv_down(Ink2CuChain *ch, Model *m, int v, int n, int pb, const float *kv, size_t vstride) {
     Cfg *c = &m->c;
     int KV = L_KV(c, v), hd = L_HD(c, v), kvo = KV * hd, cap = ch->cap[v], s0 = n > cap ? n - cap : 0;
+    const size_t rb = ink_kv_row_bytes(m->kv_type, hd);
     const float *vv = kv + vstride;
     for (int s = s0; s < n; s++) for (int h = 0; h < KV; h++) {
-        size_t dst = ((size_t)h * cap + (size_t)(pb + s) % cap) * hd, src = (size_t)s * kvo + (size_t)h * hd;
-        memcpy(m->K[v] + dst, kv + src, hd * sizeof(float));
-        memcpy(m->V[v] + dst, vv + src, hd * sizeof(float));
+        size_t row = (size_t)h * cap + (size_t)(pb + s) % cap, src = (size_t)s * kvo + (size_t)h * hd;
+        ink_kv_put(m->kv_type, (char *)m->K[v] + row * rb, kv + src, hd);
+        ink_kv_put(m->kv_type, (char *)m->V[v] + row * rb, vv + src, hd);
     }
+    (void)pb;
 }
 /* the MoE output of layer i, state layer v (routed: the host's sum, or the frame's) joining the stream:
  * x = res + sconv(mo) */

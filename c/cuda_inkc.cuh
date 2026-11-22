@@ -44,9 +44,32 @@ __global__ static void ccg_sconv_k(float *x, const float *w, float *ring, CcScon
     for (int k = 0; k < 8; k++) if (k < nh) ring[p.ring_off + c * nh + k] = hist[k];
 }
 
+/* One row of the KV mirror as a float: p.kv_type (0 f32, 1 f16, 2 q8, 3 q4; ink_kv.h's layout),
+ * rowp the row's first byte (or float). The typed mirrors hold the host cache's own rows, so a
+ * position costs a fifth to a seventh of f32's bytes. */
+__device__ __forceinline__ float ccg_kv_at(const void *rowp, int d, int type) {
+    if (type == 1) return __half2float(((const __half *)rowp)[d]);
+    if (type == 2) {
+        const unsigned char *p = (const unsigned char *)rowp + (d >> 5) * 36;
+        return (float)(signed char)p[4 + (d & 31)] * *(const float *)p;
+    }
+    if (type == 3) {
+        const unsigned char *p = (const unsigned char *)rowp + (d >> 5) * 20;
+        const int v = (p[4 + ((d & 31) >> 1)] >> ((d & 1) * 4)) & 0xF;
+        return (float)((v ^ 8) - 8) * *(const float *)p;
+    }
+    return ((const float *)rowp)[d];
+}
+/* the mirror's row of (kv head, position) as ccg_kv_at sees it: a byte offset into a typed
+ * cache, an element offset into an f32 one */
+__device__ __forceinline__ const void *ccg_kv_row(const void *base, const CcRelAttn &p, int off, int kvh, int t) {
+    const long row = (long)kvh * p.cap + t % p.cap;
+    if (p.kv_type) return (const char *)base + off + row * p.k_rowb;
+    return (const float *)base + off + row * p.hd;
+}
 /* tile b0 (128 positions from b0) of a (head, row)'s attention into its running max m, sum l and
  * weighted V (acc0: dims tid, acc1: tid + 128): chain_relattn.comp's online softmax step */
-__device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, const float *__restrict__ vc, const float *__restrict__ kvs,
+__device__ __forceinline__ void ccg_relattn_tile(const void *__restrict__ kc, const void *__restrict__ vc, const float *__restrict__ kvs,
         const float *__restrict__ relp, const CcRelAttn &p, const float *qs, const float *rs, float *pe, float *red, int *pt,
         int kvh, int qpos, int t0, int n, float ts, int b0, int tid, float &m, float &l, float &acc0, float &acc1) {
     const int i = b0 + tid;
@@ -55,8 +78,13 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
         const int t = t0 + i;
         pt[tid] = t;
         float a = 0.f;
-        if (t < p.pos_base) { const float *kr = kc + p.k_off + ((long)kvh * p.cap + t % p.cap) * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
-        else { const float *kr = kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
+        if (t < p.pos_base) {
+            const void *krow = ccg_kv_row(kc, p, p.k_off, kvh, t);
+            if (!p.kv_type) {   /* f32: the original loop, so nvcc vectorizes it as it always did */
+                const float *kr = (const float *)krow;
+                for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d];
+            } else for (int d = 0; d < p.hd; d++) a += qs[d] * ccg_kv_at(krow, d, p.kv_type);
+        } else { const float *kr = kvs + p.ks_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd; for (int d = 0; d < p.hd; d++) a += qs[d] * kr[d]; }
         const int dist = qpos - t;
         float bias = 0.f;
         if (dist < p.ext) for (int j = 0; j < p.d_rel; j++) bias += rs[j] * relp[p.relp_off + j * p.ext + dist];
@@ -78,10 +106,21 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
     for (int j = 0; j < cnt; j++) {
         const int t = pt[j];
         const float w = pe[j];
-        const float *vr = t < p.pos_base ? vc + p.v_off + ((long)kvh * p.cap + t % p.cap) * p.hd
-                                         : kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd;
-        if (d0 < p.hd) acc0 += w * vr[d0];
-        if (d1 < p.hd) acc1 += w * vr[d1];
+        if (t < p.pos_base) {
+            const void *vrow = ccg_kv_row(vc, p, p.v_off, kvh, t);
+            if (!p.kv_type) {
+                const float *vr = (const float *)vrow;
+                if (d0 < p.hd) acc0 += w * vr[d0];
+                if (d1 < p.hd) acc1 += w * vr[d1];
+            } else {
+                if (d0 < p.hd) acc0 += w * ccg_kv_at(vrow, d0, p.kv_type);
+                if (d1 < p.hd) acc1 += w * ccg_kv_at(vrow, d1, p.kv_type);
+            }
+        } else {
+            const float *vr = kvs + p.vs_off + (long)(t - p.pos_base) * p.kv_row + kvh * p.hd;
+            if (d0 < p.hd) acc0 += w * vr[d0];
+            if (d1 < p.hd) acc1 += w * vr[d1];
+        }
     }
     m = mn;
     __syncthreads();
@@ -89,7 +128,7 @@ __device__ __forceinline__ void ccg_relattn_tile(const float *__restrict__ kc, c
 /* one block of 128 per (head, row): chain_relattn.comp's online softmax over tiles of 128 positions.
  * part (the split, a decode step's rows): block z takes tile z alone, its max, sum and weighted V into
  * part (hd + 2 floats a (row, head, tile)), and ccg_relattn_join_k joins the tiles */
-__global__ static void ccg_relattn_k(const float *q, const float *kc, const float *vc, float *o, const float *kvs,
+__global__ static void ccg_relattn_k(const float *q, const void *kc, const void *vc, float *o, const float *kvs,
                                      const float *r, const float *relp, const float *tau, CcRelAttn p, float *part) {
     const int h = (int)blockIdx.x, s = (int)blockIdx.y, tid = (int)threadIdx.x;
     const int kvh = h / (p.H / p.KVH);
@@ -136,6 +175,141 @@ __global__ static void ccg_relattn_join_k(const float *part, const float *tau, f
         if (tid < p.hd) acc += pz[2 + tid] * w;
     }
     if (tid < p.hd) o[p.o_off + s * p.o_row + h * p.hd + tid] = L > 0.f ? acc / L : 0.f;
+}
+
+/* ---- the prompt path: a tile of query rows, K/V loaded once ----
+ * ccg_relattn_k launches a block per (query head, row) and each of them walks the whole cache:
+ * a prompt chunk of S rows reads the same K/V row S times. This kernel keeps CCG_QT query rows
+ * of one KV head in a block, one warp a row, and walks the cache in CCG_TP-position tiles that
+ * the block loads once into shared memory: the cache is read S/CCG_QT times less, and each
+ * position's score is a float4 dot with the query heads in shared (broadcast) instead of a
+ * serial 128-long chain. The online softmax, the sink, tau, the relative bias, the window and
+ * the ring, and the split between the mirror and kvs's own rows, are the scalar kernel's. */
+#define CCG_QT 8
+#define CCG_TP 32
+__global__ static void ccg_relattn_qt_k(const float *__restrict__ q, const void *__restrict__ kc,
+                                        const void *__restrict__ vc, float *__restrict__ o, const float *__restrict__ kvs,
+                                        const float *__restrict__ r, const float *__restrict__ relp,
+                                        const float *__restrict__ tau, CcRelAttn p) {
+    const int kvh = (int)blockIdx.x, tb0 = (int)blockIdx.y * CCG_QT, tid = (int)threadIdx.x;
+    const int wp = tid >> 5, lane = tid & 31, G = p.H / p.KVH, hd = p.hd;
+    const int krow = hd + 4;   /* padded: a row stride of a multiple of 32 floats puts every lane's
+                                * float4 in the same bank (a 32-way conflict on every K read) */
+    extern __shared__ float sm[];
+    float *Q = sm, *Kt = Q + (size_t)CCG_QT * G * hd, *Vt = Kt + (size_t)CCG_TP * krow,
+          *P = Vt + (size_t)CCG_TP * hd;
+    __shared__ int t_first, t_last;
+    if (tid == 0) {
+        int lo = 0x7fffffff, hi = -1;
+        for (int i = 0; i < CCG_QT; i++) {
+            const int s2 = tb0 + i;
+            if (s2 >= p.S) continue;
+            const int qp = p.pos_base + s2, t0 = p.window > 0 ? max(0, qp - p.window + 1) : 0;
+            if (t0 < lo) lo = t0;
+            if (qp > hi) hi = qp;
+        }
+        t_first = lo; t_last = hi;
+    }
+    for (int idx = tid; idx < CCG_QT * G * hd; idx += (int)blockDim.x) {
+        const int rr = idx / (G * hd), rest = idx - rr * G * hd, h = rest / hd, d = rest - h * hd;
+        const int s2 = tb0 + rr;
+        Q[idx] = s2 < p.S ? q[p.q_off + (long)s2 * p.q_row + (long)(kvh * G + h) * hd + d] : 0.f;
+    }
+    __syncthreads();
+    const int s = tb0 + wp;
+    const int qpos = p.pos_base + s, t0 = p.window > 0 ? max(0, qpos - p.window + 1) : 0;
+    const float ts = s < p.S ? tau[p.tau_off + s] : 0.f;
+    float m[8], l[8], acc[8][4];
+    #pragma unroll
+    for (int h = 0; h < 8; h++) {
+        m[h] = -3.0e38f; l[h] = 0.f;
+        acc[h][0] = acc[h][1] = acc[h][2] = acc[h][3] = 0.f;
+        if (h < G && s < p.S && p.has_sink) { m[h] = tau[p.sink_off + s * p.H + kvh * G + h]; l[h] = 1.f; }
+    }
+    const int d0 = lane * 4;
+    for (int tb = (t_first / CCG_TP) * CCG_TP; tb <= t_last; tb += CCG_TP) {
+        for (int idx = tid; idx < CCG_TP * hd; idx += (int)blockDim.x) {
+            const int pos = idx / hd, d = idx - pos * hd, t = tb + pos;
+            float kv = 0.f, vv = 0.f;
+            if (t <= t_last) {
+                if (t < p.pos_base) {
+                    kv = ccg_kv_at(ccg_kv_row(kc, p, p.k_off, kvh, t), d, p.kv_type);
+                    vv = ccg_kv_at(ccg_kv_row(vc, p, p.v_off, kvh, t), d, p.kv_type);
+                } else {
+                    const long off = p.ks_off + (long)(t - p.pos_base) * p.kv_row + (long)kvh * hd + d;
+                    kv = kvs[off];
+                    vv = kvs[p.vs_off + off - p.ks_off];
+                }
+            }
+            Kt[(size_t)pos * krow + d] = kv; Vt[idx] = vv;
+        }
+        __syncthreads();
+        if (s < p.S) {
+            for (int h = 0; h < G; h++) {
+                const int t = tb + lane;
+                const bool ok = t >= t0 && t <= qpos;
+                float sv = -3.0e38f;
+                if (ok) {
+                    const float4 *q4 = (const float4 *)(Q + ((size_t)wp * G + h) * hd);
+                    const float4 *k4 = (const float4 *)(Kt + (size_t)lane * krow);
+                    float4 a0 = {0.f, 0.f, 0.f, 0.f}, a1 = {0.f, 0.f, 0.f, 0.f};
+                    const int n4 = hd >> 2;
+                    for (int j = 0; j + 1 < n4; j += 2) {
+                        const float4 x = q4[j], y = k4[j], u = q4[j + 1], w = k4[j + 1];
+                        a0.x += x.x * y.x; a0.y += x.y * y.y; a0.z += x.z * y.z; a0.w += x.w * y.w;
+                        a1.x += u.x * w.x; a1.y += u.y * w.y; a1.z += u.z * w.z; a1.w += u.w * w.w;
+                    }
+                    float dot = ((a0.x + a1.x) + (a0.y + a1.y)) + ((a0.z + a1.z) + (a0.w + a1.w));
+                    float bias = 0.f;
+                    const int dist = qpos - t;
+                    if (dist < p.ext && p.d_rel > 0) {
+                        const float *rv = r + p.r_off + (long)s * p.r_row + (long)(kvh * G + h) * p.d_rel;
+                        const float *rp = relp + p.relp_off + dist;
+                        for (int j = 0; j < p.d_rel; j++) bias += rv[j] * rp[(long)j * p.ext];
+                    }
+                    sv = ts * (dot * p.scale + bias);
+                }
+                float mx = sv;
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+                const unsigned bal = __ballot_sync(0xffffffffu, ok);
+                float e = 0.f;
+                if (bal) {
+                    const float mn = fmaxf(m[h], mx);
+                    e = ok ? expf(sv - mn) : 0.f;
+                    float sum = e;
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+                    const float corr = expf(m[h] - mn);   /* a later tile's larger max: rescale what is summed */
+                    l[h] = l[h] * corr + sum;
+                    acc[h][0] *= corr; acc[h][1] *= corr; acc[h][2] *= corr; acc[h][3] *= corr;
+                    m[h] = mn;
+                }
+                P[((size_t)wp * G + h) * CCG_TP + lane] = e;
+            }
+            __syncwarp();
+            if (d0 < hd) {
+                for (int h = 0; h < G; h++) {
+                    const float *pp = P + ((size_t)wp * G + h) * CCG_TP;
+                    for (int j = 0; j < CCG_TP; j++) {
+                        const float w = pp[j];
+                        if (w == 0.f) continue;
+                        const float4 y = *(const float4 *)(Vt + (size_t)j * hd + d0);
+                        acc[h][0] += w * y.x; acc[h][1] += w * y.y; acc[h][2] += w * y.z; acc[h][3] += w * y.w;
+                    }
+                }
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+    if (s < p.S && d0 < hd) {
+        for (int h = 0; h < G; h++) {
+            const float inv = l[h] > 0.f ? 1.f / l[h] : 0.f;
+            float *orow = o + p.o_off + (long)s * p.o_row + (long)(kvh * G + h) * hd + d0;
+            for (int j = 0; j < 4 && d0 + j < hd; j++) orow[j] = acc[h][j] * inv;
+        }
+    }
 }
 
 /* one block of 256 per row: every vector's sums in one pass, the warps' joined in order */
@@ -260,8 +434,31 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
         }
         (void)cudaGetLastError();
     }
-    coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), fp(kc), fp(vc), fpw(o), fp(kvs),
-                fp(r), fp(relp), fp(tau), *p, (float *)nullptr);
+    /* a prompt chunk: a tile of query rows a block, K/V read once a tile (ccg_relattn_qt_k).
+     * COLI_CUDA_RELATTN_QT: 0 the per-(head,row) kernel, unset rows from CCG_QT. */
+    {
+        const char *e = getenv("COLI_CUDA_RELATTN_QT");
+        const int G = p->H / p->KVH;
+        const int want = e && *e ? atoi(e) : CCG_QT;
+        const size_t sm = ((size_t)CCG_QT * G * p->hd + (size_t)CCG_TP * (p->hd + 4) +
+                           (size_t)CCG_TP * p->hd + (size_t)CCG_QT * G * CCG_TP) * sizeof(float);
+        if (p->S >= want && want > 1 && G >= 1 && G <= 8 && p->hd <= 128 && (p->hd & 3) == 0 &&
+            sm <= 96 * 1024 && p->kv_type >= 0 && p->kv_type <= 3) {
+            static int attr = -1;
+            if (attr < 0)
+                attr = cudaFuncSetAttribute(ccg_relattn_qt_k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            96 * 1024) == cudaSuccess ? 1 : 0;
+            if (attr) {
+                dim3 g((unsigned)p->KVH, (unsigned)((p->S + CCG_QT - 1) / CCG_QT));
+                coli_launch(ccg_relattn_qt_k, g, 256, sm, c->stream, fp(q), (const void *)fp(kc), (const void *)fp(vc),
+                            fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p);
+                return launched(c, "relattn qt");
+            }
+            (void)cudaGetLastError();
+        }
+    }
+    coli_launch(ccg_relattn_k, dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream, fp(q), (const void *)fp(kc),
+                (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, (float *)nullptr);
     return launched(c, "relattn");
 }
 static int cc_ink2_mix(CcBuf *x, CcBuf *blk, CcBuf *prm, CcBuf *y, const CcInk2Mix *p) {

@@ -1,0 +1,14 @@
+{
+  "backend": "unsloth-b12588",
+  "ncmoe": 12,
+  "ctx": 65536,
+  "load_s": 4.0,
+  "wall_s": 441.7,
+  "prompt_n": 63977,
+  "prompt_per_second": 145.46657655804606,
+  "predicted_n": 32,
+  "predicted_per_second": 18.332304358830616,
+  "prompt_ms": 439805.497,
+  "predicted_ms": 1691.004,
+  "content_head": "\n\nThe quick brown fox jumps over the lazy dog. In a mixture-of-experts transformer, the router sends each token to a sma"
+}
