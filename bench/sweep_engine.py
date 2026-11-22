@@ -19,6 +19,7 @@ PHASES = re.compile(r"\[phases\] fill (?P<fill>[0-9.]+)s \| expert-mm (?P<expert
 BUDGET = re.compile(r"tier inkling: on, .*budget (?P<gib>[0-9.]+) GiB = (?P<n>[0-9]+) experts")
 PREFILL = re.compile(r"\[prefill (?P<s>[0-9.]+)s \| (?P<gen>[0-9]+) tokens in (?P<ds>[0-9.]+)s = (?P<tps>[0-9.]+) tok/s")
 TUNE = re.compile(r"TUNE decode: (?P<n>[0-9]+) tokens in (?P<s>[0-9.]+)s")
+FREE = re.compile(r"device 0 ready, (?P<gb>[0-9.]+) GB free")
 
 CELLS = [
     ("chunk 1024", {"COLI_CUDA_CHAIN_ROWS": ""}),
@@ -46,8 +47,9 @@ def run(binary, snap, prompt, n, env, timeout):
     out = subprocess.run([binary, "-f", prompt, "-n", str(n)], capture_output=True, text=True,
                          env=e, timeout=timeout)
     row = {"env": env, "provenance": "measured"}
-    for name, rx in (("phases", PHASES), ("prefill", PREFILL), ("tune", TUNE), ("budget", BUDGET)):
-        for line in out.stdout.splitlines():
+    text = (out.stdout or "") + "\n" + (out.stderr or "")
+    for name, rx in (("phases", PHASES), ("prefill", PREFILL), ("tune", TUNE), ("budget", BUDGET), ("free", FREE)):
+        for line in text.splitlines():
             m = rx.search(line)
             if m:
                 row[name] = m.groupdict()
@@ -73,9 +75,10 @@ def main():
         rows.append(r)
         p = r.get("phases", {})
         b = r.get("budget", {})
-        print("%-24s prefill %-8s attn %-7s expert %-7s other %-7s tier %s/%s %s" % (
+        print("%-24s prefill %-8s attn %-7s expert %-7s other %-7s tier %s/%s free %s dec %s %s" % (
             name, r.get("prefill", {}).get("s", "?"), p.get("attn", "?"), p.get("expert", "?"),
-            p.get("other", "?"), b.get("gib", "?"), b.get("n", "?"), r.get("error", "")), flush=True)
+            p.get("other", "?"), b.get("gib", "?"), b.get("n", "?"), r.get("free", {}).get("gb", "?"),
+            r.get("tune", {}).get("s", "?"), r.get("error", "")), flush=True)
     with open(a.out, "w") as f:
         json.dump(rows, f, indent=1)
     print("sweep_engine: %d cells -> %s" % (len(rows), a.out))

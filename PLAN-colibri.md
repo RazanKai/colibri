@@ -471,6 +471,56 @@ loads, prefill completes and decode runs" and all of §6 — was made on a devic
 lost the context. The *speed* figures stand (the same work was done, on zeros), but the 250K
 "works" claim did not, and the model was wrongly blamed for a bug in this fork.
 
+## 15.3 The run matrix (agreed design, before any GPU time)
+
+The estimate says whole-layer packing covers **77%** of activations (structural: layers 6–17 run
+three passes) while per-expert residency at ~71 experts a layer already covers **~90%** within a
+looped layer (top-40 carry 72–87%, top-64 86–94%). So the A/B is not "which covers more" — it is
+whether the in-frame path is fast enough per activation to beat a ~13-point coverage loss. The
+break-even, with `c_f` in-frame, `c_p` per-expert and `c_h` host per activation:
+
+    0.77·c_f + 0.23·c_h  <  0.90·c_p + 0.10·c_h
+
+`c_p` comes from the `n=0` cell and `c_f` from one `n=12` cell, so two runs say whether the sweep
+is worth finishing.
+
+**Cells** (q4, 64K prompt, 16 tokens; one at a time on the card):
+
+| cell | `COLI_VK_TIER_WHOLE` | why |
+|---|---:|---|
+| B1, B2 | 0, twice | the noise floor (1–2% seen run to run) — a 3% effect is not signal without it |
+| n6 | 6 | boundary: half the loop block |
+| **n12** | 12 | **the clean test: all twelve loop layers whole, nothing else** |
+| n13 | 13 | adds layer 0 for a 2% sliver — the full-set point from §15.2 |
+| n17 | 17 | the 64K capacity point (74% of the tier) |
+| 250K n12 | 12 | one cell **regardless of the 64K result**: 250K is where capacity binds and 64K is not |
+
+**Fields per cell**: commit; `budget X GiB = N experts`; free VRAM at launch ("device 0 ready, X GB
+free"); evictions, uploads GiB, cold experts, kept-on-CPU; "N of 24 layers in the frame"; the
+phases (fill / expert / attn / other); prefill s; **decode tok/s separately** (in-frame loop layers
+touch the same experts three times a token, so decode may gain more than prefill); RSS; and for
+every `n>0` cell the **needle + the oracle parity run** — the in-frame MoE path is exercised far
+more there, and it is the neighbourhood the typed-mirror bug lived in.
+
+**Reject a cell** when its budget differs from B1 by more than 0.1 GiB *or* its launch free VRAM
+differs by more than 0.2 GB (the 0.4 GB desktop drift is what moves the budget; it never shows in
+the env).
+
+**Routing-history caveat**: `.coli_usage` is aggregated over past runs, mostly short ones. The layer
+*totals* are structural (the three passes), but the within-layer heat and the prefill-vs-decode
+split are not. If `ROUTE_TRACE` can capture one 64K prefill, replay `bench/tier_policy_estimate.py`
+against that trace before trusting `c_p`/`c_f` for prefill.
+
+**DSpark A/B** (llama.cpp, the gate for any drafter work in this engine): same prompt, temp 0,
+`cache_prompt=false`, same `ncmoe` and q4 KV; 8K and 64K, plus one 128K cell if the 64K delta is
+large (the expert-union effect grows with depth). Log `prompt tok/s`, `decode tok/s`,
+`draft_n`/`draft_n_accepted` **and accepted tokens per verify step**, not the rate alone. The
+**without-`-md`** number is the like-for-like comparison for this engine's 16.55 tok/s at 64K — if
+it lands near 16–17, the engine has no real decode gap and P4-style decode work drops in value.
+
+**Order**: the 250K needle (first result to record) → B1/B2 → n12 → break-even → the rest only if
+the two cells justify it → DSpark at 8K/64K.
+
 ## Appendix — benchmark commands
 
 ```bash
