@@ -20,14 +20,17 @@ end-to-end retrieval check.
   bench/prompt-250k.txt -n 24`.
 
 **Where things stand (all verified on this tree unless noted).**
-- 250K, 250,156 tokens: prefill **1598.5 s** (was 3651.5, 2.28×), device side **804.7 s** (was
-  2706.7, 3.36×), decode **12.18 tok/s** (was 8.44, 1.44×), RSS 11.1 GB.
+- 250K, 250,156 tokens, two runs on this tree: prefill **1598.5 / 1791.8 s** (was 3651.5,
+  2.04–2.28×), device side **804.7 / 869.1 s** (3.11–3.36×), decode **12.18 / 11.22 tok/s**
+  (1.33–1.44×), RSS 11.1–11.4 GB. The band is the tier budget, 5.91 vs 5.62 GiB (free VRAM 11.6
+  vs 11.2 GB) — record it with every run.
 - 64K: prefill 265.6 s (chunk 1024) / 236.2 s (chunk 2048); decode 16.8–17.2 tok/s.
 - **The 250K needle passes**: the engine answers `7X4Q-ALPHA-93` at 250,156 tokens. 1K/2K/4K/8K
   also pass (`bench/needle_check.py --kv q4 --sizes 1,2,4,8`).
 - Attention kernels: prompt path 1.03 → **5.0 TFLOP/s**; decode step 8.03 → 4.15 ms.
-- `CCG_RA_TIMING=1` splits the engine's `attn` phase: 64K is 48.1 s kernel / 22.6 s
-  projections+norms+dconv+gate; scale to 250K ≈ 547 s kernel, 258 s other.
+- `CCG_RA_TIMING=1` splits the engine's `attn` phase: 64K 48.1 s kernel / 22.6 s
+  projections+norms+dconv+gate (68/32); 250K measured directly, **673.3 s kernel of 869.1 s
+  (77.5%)**, 12,864 calls, 52.34 ms a call, so 195.8 s other.
 - The expert phase is the other half: 612 s at 250K (host step, serialized with the device).
 
 **The bug that mattered (do not regress it).** With `INK2_KV=f16/q8/q4` the CUDA chain quantized

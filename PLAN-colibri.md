@@ -10,9 +10,9 @@ llama.cpp and this engine's CPU path always did.
 **250K/262K speed pass (P0–P6, §14):** the attention kernels were rebuilt (GQA-shared decode,
 K-tile transpose, one tile read per query head, exp2). 64K: prefill 387.1 → 266.6 s (1.45×),
 device side 202.6 → 69.5 s (2.91×), decode 14.94 → 16.55 tok/s. 250K with the §15 fix:
-**prefill 1598.5 s (2.28×), device side 804.7 s (3.36×), decode 12.18 tok/s (1.44×)** and the
-**needle passes at 250,156 tokens** (`7X4Q-ALPHA-93`); the kernel itself went 1.0 → 5.0
-TFLOP/s. The model is 256K-native (1M is YaRN-only), so 262144 is the acceptance point and §7
+**prefill 1598–1792 s (2.04–2.28×), device side 805–869 s (3.11–3.36×), decode 11.2–12.2 tok/s
+(1.33–1.44×)** — the band is the tier's budget, 5.6–5.9 GiB — and the **needle passes at 250,156
+tokens** on both runs (`7X4Q-ALPHA-93`); the kernel itself went 1.0 → 5.0 TFLOP/s. The model is 256K-native (1M is YaRN-only), so 262144 is the acceptance point and §7
 stays shelved.
 Target: **250K-token context (MVP)**, **1M-token context (Stage 2)**
 Engine: Colibri `dev` (v2.2.0), `inkling2` family in `c/inkling.c` + `c/inkling2.h`
@@ -738,6 +738,15 @@ The answer: `Question: what is the secret access code for the vault? Answer: 7X4
 §5's 769.4 s for tier reasons (a warm `.coli_usage` history and a larger budget this run), so the
 comparable improvement is the device side (3.36×) and the total (2.28×); a same-state A/B is the
 tier work of the revised plan, not this table.
+
+**Same tree, a second run, a worse tier budget.** `250k-current.out`, started from `d5c3ccb` with
+`CCG_RA_TIMING=1`: free VRAM 11.2 GB, `budget 5.62 GiB = 1710 experts` (against 5.91 GiB / 1798 in
+the run above), so the expert phase is 724.0 s instead of 612.4 s and prefill **1791.8 s**. The
+needle still answers **`7X4Q-ALPHA-93`**; decode 11.22 tok/s; device side 869.1 s. The attention
+kernels were measured directly this time: **673.3 s of the 869.1 s device side (77.5%)** over
+12,864 calls, 52.34 ms a call — so at 250K the other device work is 195.8 s, not the 258 s the 64K
+ratio implied. Read the two runs as a budget band, not a discrepancy: prefill **1598–1792 s**,
+device side **805–869 s**, decode **11.2–12.2 tok/s**, on 5.6–5.9 GiB of tier.
 
 **Before the fix** — the same command on the rebuilt kernels, with the typed mirror never
 uploaded (§15), so the numbers are real work done on a lost context. Phase line: `fill 5.3 s |
