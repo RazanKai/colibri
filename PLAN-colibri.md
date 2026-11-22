@@ -339,12 +339,29 @@ activations) and compares the two policies at the tier's real capacities:
 | 1803 (59%) | 0 whole | 14 whole, 79.2% |
 | 2280 (74%, the 64K run) | 0 whole | 17 whole, 85.4% |
 
-So the earlier "1 of 24 layers in the frame" is not a capacity ceiling, it is the *ranking*: a
+**Why 77% and not 13/24 = 54%: the layer totals are not equal.** The per-layer activations in the
+history are 2.08% for most layers and **6.25% for layers 6–17** — exactly 3×. Those twelve are the
+loop-pass layers ("layers 6-17 3 passes" in every chain line), so they route three times a
+forward. The top 13 layers are [0, 6…17]: 12 × 6.25% + 2.08% = **77.1%**. It is structural, not a
+skewed history: any workload routes through those twelve three times, so the *layer totals* — and
+therefore this estimate — are robust even though the within-layer heat comes from short runs.
+
+**What the metric is, precisely.** Both numbers are *coverage of a residency set by recorded
+activations*, not "served from the device": policy A's 95% says the hottest 1718 experts cover 95%
+of the activations one expert at a time, but the tier's scheduler (64 staging slots, per-step
+promotions) is what turns that into device work, and it runs no layer in-frame. Policy B's 77% is
+the share of activations in *layers the frame can take whole*. The comparison that matters is
+total device-served activations plus the per-expert-vs-in-frame speed gap, and only the A/B gives
+that. So the earlier "1 of 24 layers" was never a capacity ceiling — it is the *ranking*: a
 per-expert order spreads residency thin and never completes a layer, while the same budget packed
-by layer completes half of them and puts **77% of the routed activations** on the device side of
-the frame. That is a much larger ceiling than the 25% first estimated (the model has 128 experts a
-layer, not 256). The trade Claude named is real and is in the numbers: the other 11 layers lose
-their partial residency, and the streamed-step path does use it, so the measured A/B decides.
+by layer completes half of them.
+
+**The A/B design** (from the review, adopted): sweep `n` = 0, 8, 13 (and 17 at 64K), record the
+`budget X GiB = N experts` line per run, report prefill **and decode tok/s** separately, and run
+`needle_check.py` + the teacher-forced oracle on the `n>0` configuration — it exercises the
+in-frame MoE path far more than today's 0–1 layers, so correctness risk goes up with n. At 64K the
+tier is not capacity-bound (§15.1), so a flat 64K result does not kill the idea; 250K is where it
+should pay.
 
 **The knob already exists**: `COLI_VK_TIER_WHOLE=n` (vk_tier.c) queues the n hottest layers whole
 before the per-expert heat order, default 0. So this is a measurement, not a build. The A/B to run
@@ -546,8 +563,10 @@ The in-frame MoE path is present (`COLI_CUDA_CHAIN_MOE`) but gates every layer o
 table: `ink2cc_dm_layer` wants every expert of the layer device-resident and one format a layer,
 and `ink2cc_dm_table` sets `ch->dm_on[i] = nres == E`. The formats are **not** the blocker —
 `cc_moe_block_type(22)` covers this checkpoint's fmt 122 gate/up and `fg == 140` its NVFP4 down.
-The blocker is capacity: at 250K the tier holds 1849 of ~6144 expert slots (6.06 GiB), so a
-whole layer of 256 experts is rarely complete — **1 of 24 layers** qualified in the 64K runs
+The model has **24 layers of 128 experts** (3072 slots, not 6144 — an earlier version of this
+section said 256 a layer and was wrong). The blocker is the ranking, not the capacity: at 250K the
+tier holds 1718 of 3072 (56%) and still completes **0 of 24 layers** (§15.2) — **1 of 24 layers**
+qualified in the 64K runs
 (29–47 layer steps ran in the frame). The fix is a per-expert frame route (a partial layer) or a
 tier policy that packs whole layers, not a new block format. Until then the host's expert step
 dominates decode and this item stays open.
