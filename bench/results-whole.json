@@ -1,0 +1,77 @@
+[
+ {
+  "free": {
+   "gb": "11.3"
+  },
+  "budget": {
+   "val": "5.71",
+   "unit": "GiB",
+   "n": "1741"
+  },
+  "layers": {
+   "n": "0",
+   "l": "24"
+  },
+  "phases": {
+   "fill": "5.3",
+   "expert": "658.1",
+   "shared": "0.0",
+   "attn": "836.4",
+   "other": "180.1"
+  },
+  "prefill": {
+   "s": "1678.0",
+   "gen": "24",
+   "ds": "1.9",
+   "tps": "12.22",
+   "rss": "12.8"
+  },
+  "tune": {
+   "n": "23",
+   "s": "1.882"
+  },
+  "tier": {
+   "served": "95371722",
+   "routed": "96068736",
+   "pct": "99.3",
+   "uploads": "6636",
+   "up_gib": "21.24",
+   "up_unit": "GiB",
+   "warm": "1741",
+   "evictions": "4895",
+   "qfull": "0",
+   "rated": "0",
+   "failed": "0",
+   "dev_ms": "289534.6",
+   "cpu_ms": "238718.9",
+   "wait_ms": "160365.2",
+   "hidden_pct": "45"
+  },
+  "stream": {
+   "steps": "11760",
+   "cold": "84867",
+   "bytes": "319.96 GiB",
+   "gbps": "5.32",
+   "rows": "4503198",
+   "subs": "35190",
+   "pf": "85150",
+   "pf_used": "67700",
+   "kept": "158854",
+   "kept_rows": "695733"
+  },
+  "answer": "7X4Q-ALPHA-93. the archival group measured the throughput of the storage array in a form",
+  "found": true,
+  "host_ovl": 0.541,
+  "tier_dev_s": 289.5,
+  "tier_cpu_s": 238.7,
+  "tier_wait_s": 160.4,
+  "host_ovl_of_routed_host": 0.167,
+  "cell": "0",
+  "prompt": "prompt-250k.txt",
+  "ctx": 262144,
+  "n": 24,
+  "log": "/var/tmp/scratch/opencode/colibri-runs/250k-needle-b1f0c26.log",
+  "commit": "b1f0c26",
+  "provenance": "measured"
+ }
+]

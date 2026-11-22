@@ -466,6 +466,22 @@ exactly the symptom: fluent local continuation, total loss of anything from the 
 804.7 s, decode 12.18 tok/s. So the retrieval path works at 250,156 tokens on the same snapshot
 that "failed" in §6.
 
+**Confirmed again on the current tree (measured, b1f0c26).** `bench/prompt-250k.txt`, q4, 24
+tokens, `COLI_VK_TIER_WHOLE=0`: the answer is verbatim `7X4Q-ALPHA-93. the archival group
+measured the throughput of the storage array in a form`. Launch free VRAM **11.3 GB**, tier
+**budget 5.71 GiB = 1741 experts**; prefill **1678.0 s**, decode **12.22 tok/s**, RSS 12.8 GB.
+Phases fill 5.3 / expert-mm 658.1 / shared 0.0 / attn 836.4 / other 180.1 s. Tier: 95.37 M of
+96.07 M routed experts on the device (99.3%), uploads 6636 (21.24 GiB), evictions 4895, 11,760
+stream steps, 84,867 cold experts (319.96 GiB at 5.32 GB/s, 4.50 M rows), 158,854 cold experts
+(695,733 rows) left on the CPU; device **289.5 s**, CPU share **238.7 s**, waited **160.4 s**.
+`bench/gate.sh` passes on this tree (kernel check + needle 1K/2K/4K/8K). Log
+`/var/tmp/scratch/opencode/colibri-runs/250k-needle-b1f0c26.log`, row in
+`bench/results-whole.json`. The same run's chain report (681.6 s waiting for the device, 775.3 s
+of routed experts on the host, **0 layer steps' experts in the frame**) is the overlap measurement
+step 4 asks for: the device hid 129.2 s of the tier's host share (54% of that share, 17% of the
+routed-expert host time), and the phase line is additive, so `moe_ex` — the bulk of the expert
+phase — still runs with the device idle. See §15.5.
+
 **What this invalidates.** Every quality statement made before this fix — including §2's "250K
 loads, prefill completes and decode runs" and all of §6 — was made on a device path that had
 lost the context. The *speed* figures stand (the same work was done, on zeros), but the 250K
