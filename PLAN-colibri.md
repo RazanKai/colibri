@@ -327,6 +327,29 @@ A full q4 device mirror (9.2 GB) plus the 8 GiB tier does not fit 12 GB. Options
 - **M3** — 1M acceptance or documented 24 GB requirement. *Open.*
 - **M4** — Upstream the KV type and the tiled kernel behind env flags with docs/tests. *Open.*
 
+## 15.2 Whole-layer residency: the offline estimate, and the knob already exists
+
+Before building anything, the routing history answers whether packing whole layers can pay.
+`bench/tier_policy_estimate.py` reads `.coli_usage` (24 layers × 128 experts, 9.7e8 recorded
+activations) and compares the two policies at the tier's real capacities:
+
+| capacity | policy A: hottest experts (today) | policy B: hottest whole layers |
+|---|---|---|
+| 1718 experts (56%, the 250K run) | **0 of 24 layers whole**, 0% of activations in-frame | **13 of 24 whole, 77.1% of activations in-frame** |
+| 1803 (59%) | 0 whole | 14 whole, 79.2% |
+| 2280 (74%, the 64K run) | 0 whole | 17 whole, 85.4% |
+
+So the earlier "1 of 24 layers in the frame" is not a capacity ceiling, it is the *ranking*: a
+per-expert order spreads residency thin and never completes a layer, while the same budget packed
+by layer completes half of them and puts **77% of the routed activations** on the device side of
+the frame. That is a much larger ceiling than the 25% first estimated (the model has 128 experts a
+layer, not 256). The trade Claude named is real and is in the numbers: the other 11 layers lose
+their partial residency, and the streamed-step path does use it, so the measured A/B decides.
+
+**The knob already exists**: `COLI_VK_TIER_WHOLE=n` (vk_tier.c) queues the n hottest layers whole
+before the per-expert heat order, default 0. So this is a measurement, not a build. The A/B to run
+is 64K at `n=17` against `n=0`, at the same recorded budget, and then one 250K at `n=13`.
+
 ## 15.1 The remaining plan items: what each attempt measured
 
 **Tier budget determinism (step 2, cheap half): neither knob pins it.** Measured back to back at

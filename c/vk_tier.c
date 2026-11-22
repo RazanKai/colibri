@@ -923,6 +923,44 @@ int vkt_plan(int *layers, int *eids, int max) {
                 layers[k] = l; eids[k] = e; k++;
             }
     int kx = k;
+    /* COLI_VK_TIER_WHOLE=n: the n hottest layers whole, before the per-expert order. A layer
+     * whose every expert is on the device is what the chain's in-frame MoE needs
+     * (ink2cc_dm_layer: one format a layer, and ink2cc_dm_table sets dm_on[i] only when
+     * cut_dev_table(i) returns all E), so this turns "1 of 24 layers in the frame" into n of
+     * them; the per-expert heat order below fills whatever room is left. Default 0: unchanged. */
+    {
+        const char *we = getenv("COLI_VK_TIER_WHOLE");
+        int whole = we && *we ? atoi(we) : 0;
+        if (whole > 64) whole = 64;
+        if (whole > 0 && g_heat_hist && whole > 0) {
+            double score[64]; int pick[64];
+            for (int i = 0; i < whole; i++) { pick[i] = -1; score[i] = -1; }
+            for (int l = 0; l < L; l++) {
+                if (!g_heat_hist[l]) continue;
+                double sc = 0;
+                for (int e = 0; e < E; e++) sc += g_heat_hist[l][e];
+                int at = -1;
+                for (int i = 0; i < whole; i++) if (pick[i] < 0) { at = i; break; }
+                if (at < 0) {                     /* full: replace the weakest kept, if this beats it */
+                    int worst = 0;
+                    for (int i = 1; i < whole; i++) if (score[i] < score[worst]) worst = i;
+                    if (sc <= score[worst]) continue;
+                    at = worst;
+                }
+                pick[at] = l; score[at] = sc;
+            }
+            for (int i = 0; i < whole; i++) {
+                const int l = pick[i];
+                if (l < 0) continue;
+                for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++) {
+                    VSlot *v = &T.s[(size_t)l * E + e];
+                    if (v->state != VS_NONE) continue;
+                    v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.dque[0]++;
+                    layers[k] = l; eids[k] = e; k++;
+                }
+            }
+        }
+    }
     if (g_heat_hist) {
         int *order = malloc((size_t)L * E * sizeof(int));
         if (!order) return 0;
