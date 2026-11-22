@@ -329,11 +329,15 @@ A full q4 device mirror (9.2 GB) plus the 8 GiB tier does not fit 12 GB. Options
 
 ## 15.1 The remaining plan items: what each attempt measured
 
-**Tier budget determinism (step 2, cheap half).** `CUDA_RESERVE_GB` is **inert** in this engine:
-2.0 and 1.0 both produced 7.46 GiB (2294 vs 2297 experts) and prefill 258.1 vs 260.5 s. The dial
-that lands exactly is `CUDA_EXPERT_GB`: `=7.5` gave 7.49 GiB / 2302 experts, prefill 257.1 s
-(expert 130.7 s). So an expert A/B must pin `CUDA_EXPERT_GB` and compare at the same value; the
-run-to-run budget drift (5.46 → 5.91 → 7.68 GiB) is free VRAM at start, not a knob.
+**Tier budget determinism (step 2, cheap half): neither knob pins it.** Measured back to back at
+64K, same prompt: `CUDA_RESERVE_GB` 2.0 vs 1.0 gave 7.46 vs 7.47 GiB (2294 vs 2297 experts, prefill
+258.1 vs 260.5 s), and `CUDA_EXPERT_GB` 7.5 / 5.5 / 4.0 gave 7.42 / 7.38 / 7.39 GiB (2280 / 2268 /
+2270 experts, prefill 260.8 / 263.5 / 264.5 s). The request does not bind: the budget is *free VRAM
+minus the chain's plan*, and it lands at ~7.4 GiB at 64K whatever is asked. At 250K it came out
+5.46, 5.64 and 5.91 GiB across runs because the free VRAM at start drifted (11.2 vs 11.6 GB with
+the desktop). So this is measurement discipline, not a code change: every result must record the
+`budget X GiB = N experts` line and expert A/Bs compare only same-budget runs. The sweep scripts
+now parse that line into every row.
 
 **Chunk 2048 at 250K: negative, and for a nameable reason.** With `COLI_CUDA_CHAIN_ROWS=2048` the
 250K run made the tier's expert step 16384 activated rows: 12 `tier ... stream` lines in 42 min
