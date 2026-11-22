@@ -674,6 +674,12 @@ static int ink2cc_dm_table(Ink2CuChain *ch, Model *m) {
         int nres = cut_dev_table(i, ch->dm_ent);
         if (nres < 0) { ch->dm_state = -1; return 0; }
         ch->dm_on[i] = nres == E && ink2cc_dm_layer(ch, m, i, ch->dm_ent);
+        if (getenv("INK2CC_DM_DEBUG") && ch->dm_reads == 0) {
+            const uint32_t *w = ch->dm_ent;
+            CcExpert x; memcpy(&x, w, sizeof x);
+            fprintf(stderr, "[dmdbg] layer %2d nres %3d on %d | fg %u gs %u fd %u gd %u w18 %u g %d host %d\n",
+                    i, nres, ch->dm_on[i], w[14], w[15], w[16], w[17], w[18], x.g ? 1 : 0, x.host);
+        }
         any |= ch->dm_on[i];
         for (int e = 0; e < E; e++) {
             memcpy(&ch->dm_tabh[(size_t)i * E + e], ch->dm_ent + (size_t)e * INK2CC_ENT, sizeof(CcExpert));
