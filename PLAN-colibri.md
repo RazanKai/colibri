@@ -580,21 +580,34 @@ coherent. Prefill **1745.5 s** vs 1678.0 (+4.0%), decode **9.69** vs 12.22 tok/s
 1724 resident slots are reserved whole and only 188 are left for the other twelve layers. Expert
 phase 568.6 s (was 658.1), attn 987.2 s (was 836.4).
 
-**Verdict.** Whole-layer residency is a measured negative on this tree: it does not deliver the
-planned 77% in-frame coverage (0 of 24 at decode at n=12), it cannot affect prefill at all
-(decode-only path), and it costs the prefill 4% at 250K and 2–6% at 64K while costing decode
-16–21% at n=17. The break-even is not reached because the in-frame path never gets the loop
-layers at the measured decode step. Keep per-expert residency (default 0); do not revisit the
-whole-layer policy unless the in-frame MoE path is extended to prompt chunks and the warm start's
-layers are protected from prefill's promotions. These numbers make the earlier `n=17`/`n=13` A/B
-in §15.2/§15.3 unnecessary as a policy choice — the two cells that decide it are already
-negative.
+**The first A/B tested the layout, not the in-frame path.** At n=12 the first decode step had
+0 of 24 layers in the frame, so `cc_moe` never ran the loop layers: the measured +4.0% prefill /
+−20.7% decode is the cost of the whole-layer *residency layout*, not of in-frame MoE. Pinning is
+the missing control. `VSlot.pin` (skipped by `refresh_candidates`/`peek_victim`) makes a whole
+layer's experts ineligible as promotion victims, so the set survives prefill. With pinning:
+
+| cell | budget GiB = experts | free GB | layers in frame | prefill s | decode tok/s |
+|---|---:|---:|---:|---:|---:|
+| 64K n=0 (B1/B2) | 7.47 = 2296 / 7.48 = 2299 | 11.2 | 0/24 | 248.0 / 253.4 | 18.09 / 17.77 |
+| 64K n=12 pinned | 7.46 = 2294 | 11.2 | **12/24** | 268.1 | **18.66** (+3–5%) |
+| 250K n=0 | 5.71 = 1741 | 11.3 | 0/24 | 1678.0 | 12.22 |
+| 250K n=12 pinned | 5.63 = 1715 | 11.2 | **12/24** | 1811.4 (+7.9%) | **11.01** (−9.9%) |
+
+The in-frame path itself is a small decode gain where the tier has spare capacity (64K: +3–5%,
+2016 routed experts with no host step, needle FOUND with `COLI_VK_TIER_WHOLE=12` at 1K–8K). At
+250K it is a net loss: pinning 1536 of 1715 experts leaves ~15 a layer for the other twelve, so
+the unpinned half's host step is slower and the streamed volume rises (569.5 GiB vs 320.0 GiB);
+decode −9.9% and prefill +7.9%. The correct finding is therefore **"the earlier sweep tested the
+layout; the in-frame path is now tested: decode +3–5% at 64K, −10% at 250K, prefill +6–8% at
+both"**, not a blanket dead end. It remains rejected as a 250K policy because the tier is
+capacity-bound there; re-open it only as a decode optimization where the budget leaves the other
+layers their share, or after the in-frame MoE path is extended to prompt chunks.
 
 The `n>0` end-to-end check is the needle: with `COLI_VK_TIER_WHOLE=12`,
 `bench/needle_check.py --kv q4 --sizes 1,2,4,8` is FOUND at all four sizes, and the 250K n=12
-run answers the code. The teacher-forced oracle is a CPU/f32 parity gate, and the tier's
-device/CPU split changes the numerics (§12), so it cannot be an exact check for a `n>0` cell —
-`bench/gate.sh` (kernel reference + needle) is the correctness gate here.
+runs (unpinned and pinned) answer the code. The teacher-forced oracle is a CPU/f32 parity gate,
+and the tier's device/CPU split changes the numerics (§12), so it cannot be an exact check for a
+`n>0` cell — `bench/gate.sh` (kernel reference + needle) is the correctness gate here.
 
 ## 15.5 Host overlap, and the wavefront-vs-tensor-core decision
 
@@ -612,13 +625,20 @@ The phase line corroborates it: at 250K fill 5.3 + expert-mm 658.1 + attn 836.4 
 250K (836 s) exceeds the host step (775 s), so there is enough device time to hide it if the chain
 pipelined chunks.
 
-**Decision: build the chunk wavefront, not the tensor-core prompt kernel first.** The measured
-ceiling of the wavefront is (1 − 0.167) × 775 ≈ **645 s** at 250K; a 2.5× prompt kernel saves
-673 × (1 − 1/2.5) ≈ **404 s** and leaves the 775 s host step untouched. The wavefront's risk is
-the per-(chunk, layer) KV-upload ordering — the typed-mirror bug's neighbourhood — so it gates on
-`bench/gate.sh` and a 250K needle at every step. Tensor cores remain the fallback if the
-wavefront cannot be made correct, and the complement afterwards (the kernel work is orthogonal).
-Provenance: measured (phase and tier counters from the runs above), not derived.
+**Decision: build the chunk wavefront first, but the honest expected win is 300–450 s, not
+645 s.** The 645 s figure is a perfect-overlap ceiling (775 s of host work minus the 129 s already
+hidden) and assumes zero new cost. It is not additive with a faster attention kernel: with
+per-chunk overlap, prefill is roughly max(device, host), so once the 775 s host step is hidden
+behind the ~836 s device side, a faster kernel only helps until device time falls to the host
+time — most of a tensor-core gain is already taken by the wavefront. The 2.5× kernel is also an
+**unmeasured** target; 404 s is its ideal share of the 673 s kernel, not a result. Real overheads
+come out of the ceiling: double-buffered activations at 250K (the tier budget is the sensitive
+variable — ~0.3 GiB moved prefill by ~190 s in §15.1), CPU contention on the 6 cores between the
+host expert step, host KV quantization and kernel launches, and PCIe contention between expert
+uploads and the mirror uploads. Expect **~300–450 s**; prototype on 64K first (a cell is ~5 min)
+before committing to the 250K build. The risk remains the per-(chunk, layer) KV-upload ordering,
+gated by `bench/gate.sh` and a 250K needle. Provenance: measured overlap and phase counters;
+the 300–450 s range is estimated from them.
 
 ## 15.6 DSpark gate, measured
 
@@ -633,10 +653,12 @@ llama.cpp b12588, same IQ3_XXS, q4_0 KV, `--n-cpu-moe 12`, `-b 512 -ub 128`, tem
 The engine's 64K decode on the same tree is **17.77–18.09 tok/s** (B1/B2 in §15.4). llama.cpp
 without the drafter is 8.9–11.7% below that (inside the ~10% parity band), and with DSpark it is
 still 3.4–5.2% below the engine. The drafter is worth +6.1% at 64K and +5.1% at 8K — not a large
-delta, so no 128K cell was needed. **Decision (the rule, applied):** the engine is at decode
-parity with llama.cpp; drop decode-speed work in favour of prefill, and do not build the external
-`dflash` drafter path — in this engine's setting it would buy at most ~6% decode, while our
-no-drafter path already leads llama.cpp's drafter-assisted one at 64K.
+delta, so no 128K cell was needed. **Decision (the rule, applied):** at **64K** the engine is at
+decode parity with llama.cpp; drop decode-speed work in favour of prefill, and do not build the
+external `dflash` drafter path — in this engine's setting it would buy at most ~6% decode, while
+our no-drafter path already leads llama.cpp's drafter-assisted one at 64K. The parity statement
+is established **only up to 64K**: there is no llama.cpp 250K decode cell, so "decode work
+dropped" is not yet a 250K claim (the engine's 250K decode is 12.22 tok/s, uncompared).
 
 ## Appendix — benchmark commands
 
