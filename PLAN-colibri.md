@@ -9,10 +9,11 @@ mirror, so everything after the first 1K chunk attended to zeros. Fixed (mark th
 llama.cpp and this engine's CPU path always did.
 **250K/262K speed pass (P0–P6, §14):** the attention kernels were rebuilt (GQA-shared decode,
 K-tile transpose, one tile read per query head, exp2). 64K: prefill 387.1 → 266.6 s (1.45×),
-device side 202.6 → 69.5 s (2.91×), decode 14.94 → 16.55 tok/s. 250K: prefill **3651.5 →
-1880.2 s (1.94×)**, device side **2706.7 → 832.5 s (3.25×)**, decode **8.44 → 11.84 tok/s
-(1.40×)**; the kernel itself went 1.0 → 5.0 TFLOP/s. 1M work is postponed (see §7); a
-measurement harness and the f16 gate now exist.
+device side 202.6 → 69.5 s (2.91×), decode 14.94 → 16.55 tok/s. 250K with the §15 fix:
+**prefill 1598.5 s (2.28×), device side 804.7 s (3.36×), decode 12.18 tok/s (1.44×)** and the
+**needle passes at 250,156 tokens** (`7X4Q-ALPHA-93`); the kernel itself went 1.0 → 5.0
+TFLOP/s. The model is 256K-native (1M is YaRN-only), so 262144 is the acceptance point and §7
+stays shelved.
 Target: **250K-token context (MVP)**, **1M-token context (Stage 2)**
 Engine: Colibri `dev` (v2.2.0), `inkling2` family in `c/inkling.c` + `c/inkling2.h`
 Model: `unsloth/Inkling-2-Mini-GGUF` UD-IQ3_XXS, imported with `coli` (`arch inkling2`)
@@ -368,6 +369,11 @@ exactly the symptom: fluent local continuation, total loss of anything from the 
  8K (7288 tokens):  FOUND  7X4Q-ALPHA-93
 ```
 
+**At full context.** The 250K run of §5 with the fix (`CTX_MAX=262144`, q4, 24 tokens,
+`/var/tmp/scratch/kvtest/250k-fixed.out`) answered `7X4Q-ALPHA-93`: prefill 1598.5 s, device side
+804.7 s, decode 12.18 tok/s. So the retrieval path works at 250,156 tokens on the same snapshot
+that "failed" in §6.
+
 **What this invalidates.** Every quality statement made before this fix — including §2's "250K
 loads, prefill completes and decode runs" and all of §6 — was made on a device path that had
 lost the context. The *speed* figures stand (the same work was done, on zeros), but the 250K
@@ -571,8 +577,27 @@ device work — which caps what a tensor-core kernel can win and gives the 266 s
 
 ### 14.9 250K with the new kernels
 
-Same command and model as §5 (`CTX_MAX=262144`, `INK2_KV=q4`, 24 tokens), on the rebuilt
-kernels. Phase line: `fill 5.3 s | expert-mm 865.3 s | attn 832.5 s | other 179.0 s`.
+**With the §15 fix (this is the run that counts).** Same command and model as §5, 24 tokens:
+
+| 250K, 250,156 tokens | §5 (start) | now | |
+|---|---:|---:|---:|
+| prefill | 3651.5 s | **1598.5 s** | **2.28×** |
+| device side (`attn` phase) | 2706.7 s | **804.7 s** | **3.36×** |
+| routed experts | 769.4 s | 612.4 s | tier state, see below |
+| other | 172.9 s | 176.0 s | |
+| decode | 8.44 tok/s | **12.18 tok/s** | **1.44×** |
+| RSS | 12.2 GB | 11.1 GB | |
+| **needle at 250,156 tokens** | — | **`7X4Q-ALPHA-93`** | **passes** |
+
+The answer: `Question: what is the secret access code for the vault? Answer: 7X4Q-ALPHA-93.`
+(`/var/tmp/scratch/kvtest/250k-fixed.out`, `[cache] hit 99.8%`). The expert phase is better than
+§5's 769.4 s for tier reasons (a warm `.coli_usage` history and a larger budget this run), so the
+comparable improvement is the device side (3.36×) and the total (2.28×); a same-state A/B is the
+tier work of the revised plan, not this table.
+
+**Before the fix** — the same command on the rebuilt kernels, with the typed mirror never
+uploaded (§15), so the numbers are real work done on a lost context. Phase line: `fill 5.3 s |
+expert-mm 865.3 s | attn 832.5 s | other 179.0 s`.
 
 | 250K, 250,156 prompt tokens | §5 | now | |
 |---|---:|---:|---:|
