@@ -100,6 +100,19 @@ static int ink2cc_geometry_ok(const Model *m, int say) {
     return 1;
 }
 
+/* INK2_KV_MIRROR: where the chain's K/V mirror lives. `device` (default) the q4/f16 rows in
+ * VRAM, as before; `host` the same rows in pinned, device-mapped host memory, read by the
+ * kernel over PCIe. At 250K the q4 mirror is 2.4 GB and the tier would rather have them; the
+ * kernel's mirror traffic is small beside its arithmetic, so the trade is measured, not assumed
+ * (P2 of PLAN-colibri.md). */
+static int ink2cc_mirror_host(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("INK2_KV_MIRROR");
+        on = e && *e && (*e == 'h' || *e == 'H') ? 1 : 0;
+    }
+    return on;
+}
 /* The device bytes the chain will take beside the dense matrices (placed already by the
  * per-matrix path): the f32 router, sink and dynamic-tap projections, the parameters, the
  * convolution states, the K/V mirrors at the served context (ink_ctx_max), the loop's gates and
@@ -110,12 +123,13 @@ static size_t ink2cc_plan_bytes(const Model *m) {
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, K = (size_t)c->topk, b = 0, row = 0;
     int t = ink_ctx_max() + 8;
     const int kt = ink_kv_env();                                       /* the host cache's row type */
+    const int hm = ink2cc_mirror_host();                               /* INK2_KV_MIRROR=host: not VRAM */
     size_t kvm = 0;
     for (int v = 0; v < c->n_state; v++) { size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v); if (kvo > kvm) kvm = kvo; }
     for (int v = c->n_layers; v < c->n_state; v++) {                   /* the loop's later passes' state */
         size_t kvo = (size_t)L_KV(c, v) * L_HD(c, v);
         b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2 +
-             2 * (size_t)L_KV(c, v) * (size_t)kv_ring_rows(c, v, t) * ink_kv_row_bytes(kt, L_HD(c, v));
+             (hm ? 0 : 2 * (size_t)L_KV(c, v) * (size_t)kv_ring_rows(c, v, t) * ink_kv_row_bytes(kt, L_HD(c, v)));
     }
     if (c->loop_p > 1) {                                               /* the gates and the queries */
         size_t nl = (size_t)(c->loop_e - c->loop_s), r = (size_t)c->loop_r;
@@ -127,7 +141,7 @@ static size_t ink2cc_plan_bytes(const Model *m) {
         if (!c->local[i]) b += 2 * KV * CK * D * 4;                   /* the dynamic taps' projections */
         b += (6 * D + H * hd + H * c->d_rel + (size_t)c->d_rel * L_EXT(c, i) + 2 * kvo * CK + 2 * D * CK + E) * 4;
         b += (2 * kvo + 2 * D) * (CK - 1) * 4 * 2;                     /* the states and their read-back */
-        b += 2 * (size_t)KV * (size_t)kv_ring_rows(c, i, t) * ink_kv_row_bytes(kt, (int)hd);   /* the K/V mirror */
+        if (!hm) b += 2 * (size_t)KV * (size_t)kv_ring_rows(c, i, t) * ink_kv_row_bytes(kt, (int)hd);   /* the K/V mirror */
         size_t r1 = (14 * D + 3 * H * hd + 4 * kvo + H * c->d_rel + 2 * E + KV * CK + 2 * H) * 4;
         if (r1 > row) row = r1;
     }
@@ -388,8 +402,9 @@ static int ink2cc_mirror(Ink2CuChain *ch, Model *m) {
         ch->cap[i] = cap;
         ch->dlo[i] = 0; ch->dhi[i] = cap < m->max_t ? m->max_t : m->kv_len;   /* a ring: every row; else the positions held */
         const size_t rb = ink_kv_row_bytes(m->kv_type, hd);
-        ch->kc[i] = cc_buf((size_t)KV * (size_t)cap * rb, CC_DEV);
-        ch->vc[i] = cc_buf((size_t)KV * (size_t)cap * rb, CC_DEV);
+        const int kind = ink2cc_mirror_host() ? CC_UP : CC_DEV;   /* host: pinned, device-mapped (P2) */
+        ch->kc[i] = cc_buf((size_t)KV * (size_t)cap * rb, kind);
+        ch->vc[i] = cc_buf((size_t)KV * (size_t)cap * rb, kind);
         if (!ch->kc[i] || !ch->vc[i]) { ch->max_t = 0; ch->hostK = NULL; return 0; }
     }
     ch->max_t = m->max_t; ch->hostK = m->K;
@@ -487,6 +502,15 @@ static int ink2cc_sconv(Ink2CuChain *ch, CcBuf *x, size_t xo, int n, int C, int 
     CcSconv dv = {2, 0, 0, 0, (int)xo, 0, 0, 0, n * C, (float)sqrt((double)(c->conv_k + 1))};
     return cc_sconv(x, ch->prm, ch->rings, &p) && cc_sconv(x, NULL, NULL, &dv);
 }
+/* ---- attention accounting (P0a): the calls, the causal pairs and the FLOPs by class, so the
+ * engine's attention share is known without a profiler (the phase line's `attn` is the whole
+ * device side of a layer, not the kernel). INK2CC_RA_STATS=1 prints it. ---- */
+static struct { long calls[3]; double pairs[3]; double flop[3]; } g_ra;
+static int ink2cc_ra_stats(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("INK2CC_RA_STATS"); on = e && *e && *e != '0'; }
+    return on;
+}
 /* a global layer's dynamic convolution of K (bank 0, from nk) or V (bank 1, from nv) in kvs */
 static int ink2cc_dconv(Ink2CuChain *ch, Model *m, int i, int v, int bank, CcBuf *xin, int n) {
     Cfg *c = &m->c; int KV = L_KV(c, i), hd = L_HD(c, i), K = c->conv_k;
@@ -519,6 +543,18 @@ static int ink2cc_attention(Ink2CuChain *ch, Model *m, int i, int v, int sep, in
                     (float)(1.0 / sqrt((double)hd)), 1, 2 * R,
                     m->kv_type, (int)ink_kv_row_bytes(m->kv_type, hd)};
     CcEw gate = {CC_EW_SIGMUL, n * H * hd, H * hd, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+    if (ink2cc_ra_stats()) {
+        const int cls = n <= 8 ? 2 : (local ? 0 : 1);
+        double pr = 0;
+        for (int s = 0; s < n; s++) {
+            double q = (double)pb + s + 1;                       /* the positions up to and with s */
+            if (local && c->window > 0 && q > c->window) q = c->window;
+            pr += q;
+        }
+        g_ra.calls[cls]++;
+        g_ra.pairs[cls] += pr;
+        g_ra.flop[cls] += pr * (double)H * hd * 4.0;             /* QK^T and V, 2 FLOPs a MAC */
+    }
     ok = ok && cc_relattn(ch->q, ch->kc[v], ch->vc[v], ch->ctx, ch->kvs, ch->r, ch->prm, ch->ts, &a) &&
          cc_ew(ch->ctx, ch->ctx, ch->gt, NULL, NULL, &gate);
     if (!ok) return 0;
@@ -543,7 +579,13 @@ static int ink2cc_attention(Ink2CuChain *ch, Model *m, int i, int v, int sep, in
 }
 /* state layer v's new K/V rows (kv: K, then V vstride floats on) into the host's cache, as
  * ink2_attention writes them */
+static double ink2cc_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static double g_kv_down_s;   /* the host's quantize-into-the-cache, INK2CC_PROF prints it (P5) */
 static void ink2cc_kv_down(Ink2CuChain *ch, Model *m, int v, int n, int pb, const float *kv, size_t vstride) {
+    const double t0 = ink2cc_now();
     Cfg *c = &m->c;
     int KV = L_KV(c, v), hd = L_HD(c, v), kvo = KV * hd, cap = ch->cap[v], s0 = n > cap ? n - cap : 0;
     const size_t rb = ink_kv_row_bytes(m->kv_type, hd);
@@ -554,6 +596,7 @@ static void ink2cc_kv_down(Ink2CuChain *ch, Model *m, int v, int n, int pb, cons
         ink_kv_put(m->kv_type, (char *)m->V[v] + row * rb, vv + src, hd);
     }
     (void)pb;
+    g_kv_down_s += ink2cc_now() - t0;
 }
 /* the MoE output of layer i, state layer v (routed: the host's sum, or the frame's) joining the stream:
  * x = res + sconv(mo) */
@@ -645,7 +688,15 @@ static int ink2cc_dm_table(Ink2CuChain *ch, Model *m) {
  * backend without CC_INK2_MOE */
 static int ink2cc_dmoe(Ink2CuChain *ch, Model *m, int rows) {
     Cfg *c = &m->c; const int L = c->n_layers, E = c->n_experts, K = c->topk;
-    if (ch->dm_state < 0 || rows > CC_MOE_FRAME_ROWS || (g_topp > 0.f && g_topp < 1.f) || rt_fp || c->n_shared > 0) return 0;
+    if (ch->dm_state < 0 || rows > CC_MOE_FRAME_ROWS || (g_topp > 0.f && g_topp < 1.f) || rt_fp || c->n_shared > 0) {
+        static int said;   /* P4: the frame's MoE is gated by a shared expert, which cc_moe has no path for */
+        if (!said && c->n_shared > 0 && rows <= CC_MOE_FRAME_ROWS && !rt_fp && g_topp >= 1.f) {
+            said = 1;
+            fprintf(stderr, "[CUDA] inkling2 chain: the routed experts stay on the host: the model has %d shared "
+                            "expert(s) a layer and cc_moe has no shared-expert path (c->n_shared > 0)\n", c->n_shared);
+        }
+        return 0;
+    }
     if (ch->dm_state == 0) {
         ch->dm_state = -1;
         if (!ink2cc_dm_wanted() || !(cc_ink2_caps() & CC_INK2_MOE) || !cc_moe_ready() || !cut_ready() || cut_devices() > 1 ||
@@ -890,6 +941,17 @@ static void ink2cc_report(Model *m) {
                     "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps' experts in the frame, "
                     "%.1f MiB on the device\n",
             ch->forwards, st.frames, st.ops, st.matmuls, st.wait_ms, ch->host_ms, ch->dm_layers, st.dev_bytes / 1048576.0);
+    if (getenv("INK2CC_PROF") && *getenv("INK2CC_PROF") && *getenv("INK2CC_PROF") != '0')
+        fprintf(stderr, "[CUDA] inkling2 host: %.1f s quantizing the step's rows into the %s cache, %.1f s of routed experts\n",
+                g_kv_down_s, ink_kv_name(m->kv_type), ch->host_ms / 1e3);
+    if (ink2cc_ra_stats()) {
+        const char *nm[3] = {"ring", "global", "decode"};
+        fprintf(stderr, "[CUDA] inkling2 attention:");
+        for (int i = 0; i < 3; i++)
+            fprintf(stderr, " %s %ld calls, %.2f Gpair, %.1f GFLOP%s", nm[i], g_ra.calls[i], g_ra.pairs[i] / 1e9,
+                    g_ra.flop[i] / 1e9, i < 2 ? " |" : "");
+        fprintf(stderr, "\n");
+    }
 }
 
 /* the chain asked for at the tier's start (g_ink2cc_want): COLI_CUDA_CHAIN 1 or 2; unset, Inkling-2-Mini's

@@ -142,7 +142,17 @@ static void test_relattn(int S, int pos_base, int window, int cap, int hd, int d
     std::vector<float> y = down(bo, 0, ref.size());
     char what[160]; snprintf(what, sizeof what, "relattn S %d pos %d window %d cap %d hd %d d_rel %d ext %d sink %d %s",
                              S, pos_base, window, cap, hd, dr, ext, sink, ink_kv_name(kv_type));
-    check(ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30, 2e-5, what);
+    const double err = ok ? rel_to_max(y.data(), ref.data(), ref.size()) : 1e30;
+    if (err >= 2e-5) {   /* where it broke: a head, a row, or every output */
+        for (int h = 0; h < H; h++) {
+            double d = 0;
+            for (int s = 0; s < S; s++) for (int d2 = 0; d2 < hd; d2++)
+                d = fmax(d, fabs((double)y[((size_t)s * H + h) * hd + d2] - ref[((size_t)s * H + h) * hd + d2]));
+            printf("    head %d max |diff| %.3e  [kernel %.4f vs ref %.4f]\n", h, d,
+                   y[(size_t)h * hd], ref[(size_t)h * hd]);
+        }
+    }
+    check(err, 2e-5, what);
     CcBuf *all[] = {bq, bk, bv, bs, brr, bp, bt, bo};
     for (CcBuf *b : all) T->free(b);
 }
@@ -252,6 +262,7 @@ int main(void) {
     test_relattn(2, 9, 0, 64, 256, 64, 8, 1);
     test_relattn(1, 1500, 0, 1501, 128, 16, 512, 1);   /* a decode step at 1500 positions: twelve tiles split and joined */
     test_relattn(8, 700, 0, 708, 64, 8, 64, 0);
+    test_relattn(1, 300, 0, 400, 128, 16, 128, 0);   /* hd 128 without a sink: which one breaks it */
     for (int t = 1; t <= 3; t++) {   /* the typed mirrors: f16, q8, q4, the scalar and tiled kernels */
         test_relattn(1, 300, 0, 400, 128, 16, 128, 1, t);
         test_relattn(20, 90, 64, 64, 128, 16, 64, 1, t);

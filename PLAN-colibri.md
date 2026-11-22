@@ -5,6 +5,10 @@ prefill attention). 64K now beats the Unsloth b12588 baseline on prefill; 250K l
 completes and decode runs. The 250K needle test is **not passing yet**: the same harness fails
 at 943 tokens, so the blocker is the model/prompt, not the KV or the context path (evidence in
 §6).
+**250K/262K speed pass (P0–P6, §14):** the attention kernels were rebuilt (GQA-shared decode,
+K-tile transpose, one tile read per query head, exp2); 64K prefill 387.1 → 266.6 s (1.45×),
+the device side of the layers 202.6 → 69.5 s (2.91×), decode 14.94 → 16.55 tok/s. 1M work is
+postponed (see §7); a measurement harness and the f16 gate now exist.
 Target: **250K-token context (MVP)**, **1M-token context (Stage 2)**
 Engine: Colibri `dev` (v2.2.0), `inkling2` family in `c/inkling.c` + `c/inkling2.h`
 Model: `unsloth/Inkling-2-Mini-GGUF` UD-IQ3_XXS, imported with `coli` (`arch inkling2`)
@@ -334,3 +338,137 @@ COLI_CUDA_RELATTN_QT=0 SNAP=... CTX_MAX=70000 INK2_KV=q4 ./c/inkling -f bench/pr
 `bench/unsloth_64k.py` is the llama.cpp baseline; `bench/results-kv.json` holds the runs in
 §2.1 (q4/f16 8K, 32K/64K q4, 64K scalar A/B, 250K) with their logs under
 `/var/tmp/scratch/kvtest/` on this box.
+
+## 14. The 250K/262K speed pass (P0–P6)
+
+Scope: make 250K/262K as fast as it can be on this box; the 1M work of §7 is postponed. Every
+number below is **measured** on the same box and model unless it says otherwise; the artifacts
+are `bench/results-speed.json` (the kernel matrix, `bench/sweep_kernels.py`) and the run logs
+under `/var/tmp/scratch/kvtest/`.
+
+### 14.1 P0 — measurement, the range audit, and the gates
+
+- **P0a `c/cuda_inkc_bench`** (`make -C c cuda-inkc-bench`): the attention kernels through the
+  chain's ops table against a synthetic q4 cache at a served context, reporting ms, achieved
+  mirror GB/s and effective FLOP/s for a prompt chunk and a decode step. A kernel change is
+  now measured in seconds, not in a 60-minute prefill. `bench/sweep_kernels.py` runs the matrix
+  (P6) and writes JSON.
+- **The phase line's `attn` is not the kernel.** `m->t_attn` is the wall time of `cc_submit` +
+  `cc_finish` for a layer, i.e. the whole device side (projections, norms, clips, dconv, the
+  gate, attention). `INK2CC_RA_STATS=1` now prints the attention calls, causal pairs and FLOPs
+  by class; at 64K the 504 global calls are 2.01e14 FLOP, and 69.5 s of device time is
+  3.35 TFLOP/s.
+- **P0b range audit** (`INK_KV_STATS=1`), sampled over every state layer: 250K q4 run,
+  max |K| 20.04, max |V| 11.27, block scale max 2.862 (K) / 1.609 (V), **0% of values above
+  f16's 65504**. So a 16-bit K/V input (the tensor-core path) is range-safe for this
+  checkpoint; the codec's f32 scales stay as they are.
+- **P0c** the parity gates already in the tree (`cuda-inkc-check` against the CPU reference, the
+  teacher-forced argmax oracle) are the kernel gate and both pass; `INK_IDS_DUMP` dumps the
+  prompt's ids for the oracle, and a failed `relattn` case now prints a per-head diff. The 250K
+  needle of §6 remains open and is what any *retrieval* claim still waits on.
+
+### 14.2 P1.1 — the prompt kernel, restructured (fp32, no tensor cores)
+
+`ccg_relattn_qt_t<G>` (one instantiation a query-head group, so a G of 3 does not pay for 8):
+
+- **K's tile transposed on its float4**: the row-major tile put every lane's `float4` in the
+  same four banks (a 4-way conflict on every K read). The tile is now `[dim/4][32 positions]`,
+  conflict-free.
+- **the tile is read once for every query head**: the dot walks the K row with all G
+  accumulators live (G times fewer shared reads, G-way ILP), and the V `float4` is loaded once
+  a position and used by every head.
+- `exp2f` with the softmax folded into log2 e; the branch out of the V loop.
+- Typed rows are dequantized 4 values at a time in the prompt path and 32 values (one codec
+  block, coalesced) in the decode path.
+
+Measured (`cuda_inkc_bench`, q4, 250K, a 1024-row chunk against the full prefix):
+
+| shape | before | after | |
+|---|---:|---:|---:|
+| H=64 (same shape both) | 8511 ms, 1.03 TFLOP/s | **1425 ms, 6.16 TFLOP/s** | 5.97× |
+| H=24 (Mini) | 1.03 TFLOP/s (same kernel, per-row rate) | **656 ms, 5.02 TFLOP/s** | 4.9× the rate |
+
+### 14.3 P3 — the decode step, GQA-shared
+
+`ccg_relattn_dec_k`: a block a (KV head, 128 positions), the tile's K and V dequantized once
+into shared and every query head of that KV head reading them (the split walk had a block a
+(query *head*, row) and read and dequantized the same rows G times), the block's warps carrying
+an online softmax across four 32-position pieces so one partial a 128 positions is written, and
+a persistent partial buffer instead of a 65 MiB `cudaMallocAsync` a layer.
+
+Measured (q4, 250K, one global layer's step): **8.03 → 4.15 ms (1.94×)**, 401 → 777 GFLOP/s.
+`COLI_CUDA_RELATTN_GQA=0` restores the old walk.
+
+### 14.4 P2 — the mirror off VRAM (measured, negative)
+
+`INK2_KV_MIRROR=host` puts the q4 mirror in pinned, device-mapped host memory, freeing 2.4 GB
+of VRAM at 250K for the expert tier. Measured at 64K (63,977 tokens, 32 tokens):
+
+| 64K | mirror on the device | mirror in host memory |
+|---|---:|---:|
+| prefill | 266.6 s | **745.4 s** |
+| device side of the layers | 69.5 s | **577.0 s** |
+| decode | 16.55 tok/s | 8.58 tok/s |
+| tier budget | 8.26 GiB | 8.41 GiB |
+
+The kernel's q4 row reads over PCIe are far slower than the same reads from VRAM, and the tiled
+kernel reads each row once per 8-query-row tile, so the mirror's traffic is amplified. The freed
+bytes did not become tier space either (+0.15 GiB). **Conclusion: the mirror stays on the
+device**; the flag is kept for a card where VRAM, not PCIe, is the binding constraint.
+
+### 14.5 P4 — the expert/decode floor
+
+The in-frame MoE path is present (`COLI_CUDA_CHAIN_MOE`) but gates every layer on a per-layer
+format check (`ink2cc_dm_layer`: one format a layer, every expert resident, a `cc_moe` block
+type). This checkpoint's tier reports fmt 122 (gate/up) and 140 (down); **1 of 24 layers**
+qualifies and runs its experts in the frame (29–47 layer steps in the 64K runs). The concrete
+blocker is a `cc_moe` IQ2_S (fmt 122) path; until then the host's expert step dominates decode
+and this item stays open.
+
+### 14.6 P5 — the overhead
+
+`INK2CC_PROF=1` puts a number on the host's side: at 64K, **15.8 s** of the 46.6 s `other` is
+`ink2cc_kv_down` quantizing every state layer's step rows into the q4 cache (6.3e9 values, ~2.5
+ns a value, scalar); it scales to ~62 s at 250K. `COLI_PREFIX_STORE=0` changed nothing
+(277.3 s vs 266.6 s, run noise), so the prefix store is not the overhead. The next step is a
+vectorized q4/q8 block packer (same arithmetic, same rounding, ~4× fewer instructions); not
+done in this pass.
+
+### 14.7 P6 — the tuning matrix
+
+`bench/sweep_kernels.py` (`--quick`: 64K/250K, q4, H 24/64, chunk and step) writes
+`bench/results-speed.json` with `provenance: measured` on every cell and records the env it ran
+under, so the same file serves the `COLI_CUDA_RELATTN_GQA=0` / `COLI_CUDA_RELATTN_QT=0` A/Bs.
+Engine-level cells (chunk rows, tier budget) are still to be swept.
+
+### 14.8 End to end, 64K
+
+Same prompt and box as §2.1, `INK2_KV=q4`, CUDA, `OMP_NUM_THREADS=6`, 32 tokens:
+
+| 64K, 63,977 tokens | §2.1 | now | |
+|---|---:|---:|---:|
+| prefill | 387.1 s | **266.6 s** | 1.45× |
+| device side (the `attn` phase) | 202.6 s | **69.5 s** | 2.91× |
+| routed experts | 138.9 s | 148.8 s | run noise |
+| other | 44.4 s | 46.4 s | |
+| decode | 14.94 tok/s | **16.55 tok/s** | 1.11× |
+| RSS | 10.2 GB | 9.2 GB | |
+
+8K (8,027 tokens): the device side 8.1 → 4.1 s; prefill 31.1 → 28.2 s with 8 tokens.
+
+The 250K run of §5 is repeated with these kernels in §14.9.
+
+### 14.9 250K with the new kernels
+
+(filled from the run log: `/var/tmp/scratch/kvtest/250k-new.err`.)
+
+### 14.10 What is still open
+
+- **The tensor-core prompt path (P1.2)** was not written. The gate it needed is now measured:
+  f16 is range-safe for this checkpoint (§14.1). With the fp32 kernel at 5.0 TFLOP/s, the
+  case for hand-written `mma` is weaker than when the plan was written (it was at 1.0), and it
+  must still pass the same CPU-reference and oracle gates. The structural wins above were
+  cheaper and are in.
+- **P4** waits on a `cc_moe` IQ2_S path.
+- **P5** waits on a vectorized block packer (~62 s at 250K).
+- **§6's needle** is still the gate on any retrieval claim at 250K.

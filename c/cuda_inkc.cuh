@@ -60,6 +60,45 @@ __device__ __forceinline__ float ccg_kv_at(const void *rowp, int d, int type) {
     }
     return ((const float *)rowp)[d];
 }
+/* 32 values of a typed row, one codec block (ink_kv.h's layout), read as the block they are and
+ * widened into out[]: the value-at-a-time reads of ccg_kv_at were one or two bytes a thread with
+ * the rows 80 bytes apart, which the memory system cannot coalesce. m the values this block holds
+ * (32 but a row's last one). */
+__device__ __forceinline__ void ccg_kv_blk(const void *rowp, int blk, int m, int type, float *out) {
+    if (type == 1) {
+        const __half *h = (const __half *)rowp + blk * 32;
+        for (int i = 0; i < 32; i++) out[i] = i < m ? __half2float(h[i]) : 0.f;
+    } else if (type == 2) {
+        const unsigned char *p = (const unsigned char *)rowp + blk * 36;
+        const float s = *(const float *)p;
+        unsigned w[8];                       /* 32 int8: eight words, four values a word */
+        memcpy(w, p + 4, 32);
+        for (int i = 0; i < 8; i++) {
+            const unsigned x = w[i];
+            out[i * 4 + 0] = i * 4 + 0 < m ? (float)(signed char)(x & 0xFF) * s : 0.f;
+            out[i * 4 + 1] = i * 4 + 1 < m ? (float)(signed char)((x >> 8) & 0xFF) * s : 0.f;
+            out[i * 4 + 2] = i * 4 + 2 < m ? (float)(signed char)((x >> 16) & 0xFF) * s : 0.f;
+            out[i * 4 + 3] = i * 4 + 3 < m ? (float)(signed char)(x >> 24) * s : 0.f;
+        }
+    } else if (type == 3) {
+        const unsigned char *p = (const unsigned char *)rowp + blk * 20;
+        const float s = *(const float *)p;
+        unsigned w[4];
+        memcpy(w, p + 4, 16);
+        for (int i = 0; i < 8; i++) {
+            const unsigned x = w[i >> 1] >> ((i & 1) * 16);
+            const int a = (int)((x & 0xF) ^ 8) - 8, b = (int)(((x >> 4) & 0xF) ^ 8) - 8;
+            const int c = (int)(((x >> 8) & 0xF) ^ 8) - 8, d = (int)(((x >> 12) & 0xF) ^ 8) - 8;
+            out[i * 4 + 0] = i * 4 + 0 < m ? (float)a * s : 0.f;
+            out[i * 4 + 1] = i * 4 + 1 < m ? (float)b * s : 0.f;
+            out[i * 4 + 2] = i * 4 + 2 < m ? (float)c * s : 0.f;
+            out[i * 4 + 3] = i * 4 + 3 < m ? (float)d * s : 0.f;
+        }
+    } else {
+        const float *f = (const float *)rowp + blk * 32;
+        for (int i = 0; i < 32; i++) out[i] = i < m ? f[i] : 0.f;
+    }
+}
 /* the mirror's row of (kv head, position) as ccg_kv_at sees it: a byte offset into a typed
  * cache, an element offset into an f32 one */
 __device__ __forceinline__ const void *ccg_kv_row(const void *base, const CcRelAttn &p, int off, int kvh, int t) {
@@ -177,6 +216,134 @@ __global__ static void ccg_relattn_join_k(const float *part, const float *tau, f
     if (tid < p.hd) o[p.o_off + s * p.o_row + h * p.hd + tid] = L > 0.f ? acc / L : 0.f;
 }
 
+/* ---- the decode path, GQA-shared (COLI_CUDA_RELATTN_GQA=0: the split walk of ccg_relattn_k) ----
+ * ccg_relattn_k launches a block a (query head, row) and every one of them walks, reads and
+ * dequantizes the same K/V rows: the G query heads of a KV head do that G times. This kernel has
+ * a block a (KV head, CCG_DTB positions): the tile's K and V are dequantized once into shared in
+ * CCG_DTP-position pieces and the block's warps, one a query head, keep an online softmax over
+ * them, so the mirror is read and dequantized once a KV head and a block writes one partial a
+ * (row, head, tile of CCG_DTB) instead of one a 32-position piece. The pieces carry CCG_DTS rows
+ * (CCG_DTP plus a decoding row's shift of up to 8), K transposed on its float4 (conflict-free),
+ * and the partials are ccg_relattn_join_k's (row, head, tile) layout. */
+#define CCG_DTP 32
+#define CCG_DTB 128
+#define CCG_DTS 40
+__global__ static void ccg_relattn_dec_k(const float *__restrict__ q, const void *__restrict__ kc,
+                                         const void *__restrict__ vc, const float *__restrict__ kvs,
+                                         const float *__restrict__ r, const float *__restrict__ relp,
+                                         const float *__restrict__ tau, CcRelAttn p, float *part, int nc) {
+    const int kvh = (int)blockIdx.x, z = (int)blockIdx.y, tid = (int)threadIdx.x;
+    const int wp = tid >> 5, lane = tid & 31, G = p.H / p.KVH, hd = p.hd, kd4 = hd >> 2;
+    const int nthr = (int)blockDim.x, nblk = (hd + 31) >> 5;
+    extern __shared__ float sm[];
+    float *Kt4 = sm, *Vt = Kt4 + (size_t)kd4 * CCG_DTS * 4, *qs = Vt + (size_t)CCG_DTS * hd,
+          *P = qs + (size_t)G * p.S * hd;
+    const int t0_0 = p.window > 0 ? (p.pos_base - p.window + 1 > 0 ? p.pos_base - p.window + 1 : 0) : 0;
+    const int tb = t0_0 + z * CCG_DTB;
+    if (z * CCG_DTB >= (p.window > 0 ? p.window : p.pos_base + p.S)) return;
+    for (int idx = tid; idx < G * p.S * hd; idx += nthr) {
+        const int g = idx / (p.S * hd), rem = idx - g * p.S * hd, s2 = rem / hd, d = rem - s2 * hd;
+        qs[idx] = q[p.q_off + (long)s2 * p.q_row + (long)(kvh * G + g) * hd + d];
+    }
+    __syncthreads();
+    /* every warp stays for the tile's dequantization: returning the spare ones here left the
+     * pieces' last rows to a stride no live thread walked */
+    const int g = wp, h = kvh * G + g, d0 = lane * 4;
+    const bool mine = wp < G;
+    const int nmax = p.window > 0 ? p.window : p.pos_base + p.S;
+    float m[8], l[8], acc[8][4];
+    for (int s = 0; s < 8; s++) {
+        m[s] = -3.0e38f; l[s] = 0.f;
+        acc[s][0] = acc[s][1] = acc[s][2] = acc[s][3] = 0.f;
+    }
+    for (int sub = 0; sub < CCG_DTB / CCG_DTP; sub++) {
+        const int stb = tb + sub * CCG_DTP;
+        if (stb - t0_0 >= nmax) break;              /* no served position left in the block */
+        for (int idx = tid; idx < CCG_DTS * nblk; idx += nthr) {
+            const int pos = idx / nblk, blk = idx - pos * nblk, t = stb + pos;
+            float kb[32], vb[32];
+            if (t < p.pos_base) {
+                const int mm = hd - blk * 32 < 32 ? hd - blk * 32 : 32;
+                ccg_kv_blk(ccg_kv_row(kc, p, p.k_off, kvh, t), blk, mm, p.kv_type, kb);
+                ccg_kv_blk(ccg_kv_row(vc, p, p.v_off, kvh, t), blk, mm, p.kv_type, vb);
+            } else if (t < p.pos_base + p.S) {
+                const long o = (long)(t - p.pos_base) * p.kv_row + (long)kvh * hd + blk * 32;
+                for (int i = 0; i < 32 && blk * 32 + i < hd; i++) { kb[i] = kvs[p.ks_off + o + i]; vb[i] = kvs[p.vs_off + o + i]; }
+            } else for (int i = 0; i < 32; i++) kb[i] = vb[i] = 0.f;
+            for (int i = 0; i < 32 && blk * 32 + i < hd; i += 4) {
+                const int d4 = (blk * 32 + i) >> 2;
+                *(float4 *)(Kt4 + ((size_t)d4 * CCG_DTS + pos) * 4) = make_float4(kb[i], kb[i + 1], kb[i + 2], kb[i + 3]);
+                *(float4 *)(Vt + (size_t)pos * hd + d4 * 4) = make_float4(vb[i], vb[i + 1], vb[i + 2], vb[i + 3]);
+            }
+        }
+        __syncthreads();
+        if (mine) {
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                if (s >= p.S) continue;       /* a constant bound keeps m/l/acc in registers */
+                const int qpos = p.pos_base + s;
+                const int t0 = p.window > 0 ? (qpos - p.window + 1 > 0 ? qpos - p.window + 1 : 0) : 0;
+                const int off = t0 - t0_0;   /* 0..7: a row's piece starts at most 7 positions on */
+                const int t = stb + off + lane;
+                const float ts = tau[p.tau_off + s];
+                const bool ok = t >= t0 && t <= qpos;
+                float sv = -3.0e38f;
+                if (ok) {
+                    float4 a = {0.f, 0.f, 0.f, 0.f};
+                    const float4 *qq = (const float4 *)(qs + ((size_t)g * p.S + s) * hd);
+                    for (int j = 0; j < kd4; j++) {
+                        const float4 kk = *(const float4 *)(Kt4 + ((size_t)j * CCG_DTS + off + lane) * 4);
+                        const float4 q4 = qq[j];
+                        a.x += q4.x * kk.x; a.y += q4.y * kk.y; a.z += q4.z * kk.z; a.w += q4.w * kk.w;
+                    }
+                    const float dot = ((a.x + a.y) + (a.z + a.w));
+                    float bias = 0.f;
+                    const int dist = qpos - t;
+                    if (dist < p.ext && p.d_rel > 0) {
+                        const float *rv = r + p.r_off + (long)s * p.r_row + (long)h * p.d_rel;
+                        const float *rp = relp + p.relp_off + dist;
+                        for (int j = 0; j < p.d_rel; j++) bias += rv[j] * rp[(long)j * p.ext];
+                    }
+                    sv = ts * (dot * p.scale + bias);
+                }
+                float mx = sv;
+                #pragma unroll
+                for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+                float e = 0.f;
+                if (__ballot_sync(0xffffffffu, ok)) {
+                    const float mn = fmaxf(m[s], mx);
+                    e = ok ? exp2f((sv - mn) * 1.4426950408889634f) : 0.f;
+                    float sum = e;
+                    #pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                    const float corr = exp2f((m[s] - mn) * 1.4426950408889634f);
+                    l[s] = l[s] * corr + sum;
+                    acc[s][0] *= corr; acc[s][1] *= corr; acc[s][2] *= corr; acc[s][3] *= corr;
+                    m[s] = mn;
+                }
+                P[(size_t)g * CCG_DTS + off + lane] = e;
+                __syncwarp();
+                if (d0 < hd) for (int j = 0; j < CCG_DTP; j++) {
+                    const float w = P[(size_t)g * CCG_DTS + off + j];
+                    const float4 vv = *(const float4 *)(Vt + (size_t)(off + j) * hd + d0);
+                    acc[s][0] += w * vv.x; acc[s][1] += w * vv.y; acc[s][2] += w * vv.z; acc[s][3] += w * vv.w;
+                }
+                __syncwarp();
+            }
+        }
+        __syncthreads();
+    }
+    if (mine) {
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            if (s >= p.S) continue;
+            float *pp = part + (((long)s * p.H + h) * nc + z) * (p.hd + 2);
+            if (lane == 0) { pp[0] = m[s]; pp[1] = l[s]; }
+            if (d0 < hd) { float *pd = pp + 2 + d0; pd[0] = acc[s][0]; pd[1] = acc[s][1]; pd[2] = acc[s][2]; pd[3] = acc[s][3]; }
+        }
+    }
+}
+
 /* ---- the prompt path: a tile of query rows, K/V loaded once ----
  * ccg_relattn_k launches a block per (query head, row) and each of them walks the whole cache:
  * a prompt chunk of S rows reads the same K/V row S times. This kernel keeps CCG_QT query rows
@@ -187,16 +354,20 @@ __global__ static void ccg_relattn_join_k(const float *part, const float *tau, f
  * the ring, and the split between the mirror and kvs's own rows, are the scalar kernel's. */
 #define CCG_QT 8
 #define CCG_TP 32
-__global__ static void ccg_relattn_qt_k(const float *__restrict__ q, const void *__restrict__ kc,
+/* One instantiation a G (the query heads of a KV head, 1..8): the head loop unrolls with a
+ * constant bound, so the accumulators stay in registers and a G of 3 does not pay for 8. */
+template <int G>
+__global__ static void ccg_relattn_qt_t(const float *__restrict__ q, const void *__restrict__ kc,
                                         const void *__restrict__ vc, float *__restrict__ o, const float *__restrict__ kvs,
                                         const float *__restrict__ r, const float *__restrict__ relp,
                                         const float *__restrict__ tau, CcRelAttn p) {
     const int kvh = (int)blockIdx.x, tb0 = (int)blockIdx.y * CCG_QT, tid = (int)threadIdx.x;
-    const int wp = tid >> 5, lane = tid & 31, G = p.H / p.KVH, hd = p.hd;
-    const int krow = hd + 4;   /* padded: a row stride of a multiple of 32 floats puts every lane's
-                                * float4 in the same bank (a 32-way conflict on every K read) */
+    const int wp = tid >> 5, lane = tid & 31, hd = p.hd, kd4 = hd >> 2;
     extern __shared__ float sm[];
-    float *Q = sm, *Kt = Q + (size_t)CCG_QT * G * hd, *Vt = Kt + (size_t)CCG_TP * krow,
+    /* Q[QT][G][hd]; Kt4[d4][TP] float4, the K tile transposed on its dim chunks so a lane's
+     * float4 is conflict-free (the row-major tile put all 32 lanes' float4 in the same four
+     * banks); Vt[TP][hd]; P[G][TP]. */
+    float *Q = sm, *Kt4 = Q + (size_t)CCG_QT * G * hd, *Vt = Kt4 + (size_t)kd4 * CCG_TP * 4,
           *P = Vt + (size_t)CCG_TP * hd;
     __shared__ int t_first, t_last;
     if (tid == 0) {
@@ -219,56 +390,64 @@ __global__ static void ccg_relattn_qt_k(const float *__restrict__ q, const void 
     const int s = tb0 + wp;
     const int qpos = p.pos_base + s, t0 = p.window > 0 ? max(0, qpos - p.window + 1) : 0;
     const float ts = s < p.S ? tau[p.tau_off + s] : 0.f;
-    float m[8], l[8], acc[8][4];
+    float m[G], l[G], acc[G][4];
     #pragma unroll
-    for (int h = 0; h < 8; h++) {
+    for (int h = 0; h < G; h++) {
         m[h] = -3.0e38f; l[h] = 0.f;
         acc[h][0] = acc[h][1] = acc[h][2] = acc[h][3] = 0.f;
-        if (h < G && s < p.S && p.has_sink) { m[h] = tau[p.sink_off + s * p.H + kvh * G + h]; l[h] = 1.f; }
+        if (s < p.S && p.has_sink) { m[h] = tau[p.sink_off + s * p.H + kvh * G + h]; l[h] = 1.f; }
     }
     const int d0 = lane * 4;
     for (int tb = (t_first / CCG_TP) * CCG_TP; tb <= t_last; tb += CCG_TP) {
-        for (int idx = tid; idx < CCG_TP * hd; idx += (int)blockDim.x) {
-            const int pos = idx / hd, d = idx - pos * hd, t = tb + pos;
-            float kv = 0.f, vv = 0.f;
+        /* the tile, read and dequantized once: K by dim chunk, V by row */
+        for (int idx = tid; idx < kd4 * CCG_TP; idx += (int)blockDim.x) {
+            const int d4 = idx / CCG_TP, pos = idx - d4 * CCG_TP, t = tb + pos;
+            float4 kv = {0.f, 0.f, 0.f, 0.f}, vv4 = {0.f, 0.f, 0.f, 0.f};
             if (t <= t_last) {
                 if (t < p.pos_base) {
-                    kv = ccg_kv_at(ccg_kv_row(kc, p, p.k_off, kvh, t), d, p.kv_type);
-                    vv = ccg_kv_at(ccg_kv_row(vc, p, p.v_off, kvh, t), d, p.kv_type);
+                    const void *kr = ccg_kv_row(kc, p, p.k_off, kvh, t), *vr = ccg_kv_row(vc, p, p.v_off, kvh, t);
+                    kv.x = ccg_kv_at(kr, d4 * 4 + 0, p.kv_type); vv4.x = ccg_kv_at(vr, d4 * 4 + 0, p.kv_type);
+                    kv.y = ccg_kv_at(kr, d4 * 4 + 1, p.kv_type); vv4.y = ccg_kv_at(vr, d4 * 4 + 1, p.kv_type);
+                    kv.z = ccg_kv_at(kr, d4 * 4 + 2, p.kv_type); vv4.z = ccg_kv_at(vr, d4 * 4 + 2, p.kv_type);
+                    kv.w = ccg_kv_at(kr, d4 * 4 + 3, p.kv_type); vv4.w = ccg_kv_at(vr, d4 * 4 + 3, p.kv_type);
                 } else {
-                    const long off = p.ks_off + (long)(t - p.pos_base) * p.kv_row + (long)kvh * hd + d;
-                    kv = kvs[off];
-                    vv = kvs[p.vs_off + off - p.ks_off];
+                    const long o = (long)(t - p.pos_base) * p.kv_row + (long)kvh * hd + d4 * 4;
+                    kv = *(const float4 *)(kvs + p.ks_off + o);
+                    vv4 = *(const float4 *)(kvs + p.vs_off + o);
                 }
             }
-            Kt[(size_t)pos * krow + d] = kv; Vt[idx] = vv;
+            *(float4 *)(Kt4 + ((size_t)d4 * CCG_TP + pos) * 4) = kv;
+            *(float4 *)(Vt + (size_t)pos * hd + d4 * 4) = vv4;
         }
         __syncthreads();
         if (s < p.S) {
-            for (int h = 0; h < G; h++) {
-                const int t = tb + lane;
-                const bool ok = t >= t0 && t <= qpos;
-                float sv = -3.0e38f;
-                if (ok) {
-                    const float4 *q4 = (const float4 *)(Q + ((size_t)wp * G + h) * hd);
-                    const float4 *k4 = (const float4 *)(Kt + (size_t)lane * krow);
-                    float4 a0 = {0.f, 0.f, 0.f, 0.f}, a1 = {0.f, 0.f, 0.f, 0.f};
-                    const int n4 = hd >> 2;
-                    for (int j = 0; j + 1 < n4; j += 2) {
-                        const float4 x = q4[j], y = k4[j], u = q4[j + 1], w = k4[j + 1];
-                        a0.x += x.x * y.x; a0.y += x.y * y.y; a0.z += x.z * y.z; a0.w += x.w * y.w;
-                        a1.x += u.x * w.x; a1.y += u.y * w.y; a1.z += u.z * w.z; a1.w += u.w * w.w;
+            const int t = tb + lane, dist = qpos - t;
+            const bool ok = t >= t0 && t <= qpos;
+            /* every head's dot from one walk of the lane's K row: the K read is G times cheaper,
+             * and the G accumulators give the loop its parallelism */
+            float4 a[G];
+            #pragma unroll
+            for (int h = 0; h < G; h++) a[h].x = a[h].y = a[h].z = a[h].w = 0.f;
+            if (ok) {
+                for (int j = 0; j < kd4; j++) {
+                    const float4 kk = *(const float4 *)(Kt4 + ((size_t)j * CCG_TP + lane) * 4);
+                    #pragma unroll
+                    for (int h = 0; h < G; h++) {
+                        const float4 qq = ((const float4 *)(Q + ((size_t)wp * G + h) * hd))[j];
+                        a[h].x += qq.x * kk.x; a[h].y += qq.y * kk.y; a[h].z += qq.z * kk.z; a[h].w += qq.w * kk.w;
                     }
-                    float dot = ((a0.x + a1.x) + (a0.y + a1.y)) + ((a0.z + a1.z) + (a0.w + a1.w));
-                    float bias = 0.f;
-                    const int dist = qpos - t;
-                    if (dist < p.ext && p.d_rel > 0) {
-                        const float *rv = r + p.r_off + (long)s * p.r_row + (long)(kvh * G + h) * p.d_rel;
-                        const float *rp = relp + p.relp_off + dist;
-                        for (int j = 0; j < p.d_rel; j++) bias += rv[j] * rp[(long)j * p.ext];
-                    }
-                    sv = ts * (dot * p.scale + bias);
                 }
+            }
+            #pragma unroll
+            for (int h = 0; h < G; h++) {
+                const float dot = ((a[h].x + a[h].y) + (a[h].z + a[h].w));
+                float bias = 0.f;
+                if (ok && dist < p.ext && p.d_rel > 0) {
+                    const float *rv = r + p.r_off + (long)s * p.r_row + (long)(kvh * G + h) * p.d_rel;
+                    const float *rp = relp + p.relp_off + dist;
+                    for (int j = 0; j < p.d_rel; j++) bias += rv[j] * rp[(long)j * p.ext];
+                }
+                const float sv = ok ? ts * (dot * p.scale + bias) : -3.0e38f;
                 float mx = sv;
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
@@ -276,11 +455,11 @@ __global__ static void ccg_relattn_qt_k(const float *__restrict__ q, const void 
                 float e = 0.f;
                 if (bal) {
                     const float mn = fmaxf(m[h], mx);
-                    e = ok ? expf(sv - mn) : 0.f;
+                    e = ok ? exp2f((sv - mn) * 1.4426950408889634f) : 0.f;   /* expf(x) = exp2f(x log2 e) */
                     float sum = e;
                     #pragma unroll
                     for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
-                    const float corr = expf(m[h] - mn);   /* a later tile's larger max: rescale what is summed */
+                    const float corr = exp2f((m[h] - mn) * 1.4426950408889634f);   /* a later tile's larger max */
                     l[h] = l[h] * corr + sum;
                     acc[h][0] *= corr; acc[h][1] *= corr; acc[h][2] *= corr; acc[h][3] *= corr;
                     m[h] = mn;
@@ -289,12 +468,12 @@ __global__ static void ccg_relattn_qt_k(const float *__restrict__ q, const void 
             }
             __syncwarp();
             if (d0 < hd) {
-                for (int h = 0; h < G; h++) {
-                    const float *pp = P + ((size_t)wp * G + h) * CCG_TP;
-                    for (int j = 0; j < CCG_TP; j++) {
-                        const float w = pp[j];
-                        if (w == 0.f) continue;
-                        const float4 y = *(const float4 *)(Vt + (size_t)j * hd + d0);
+                /* the V tile's float4 read once a position and used by every head */
+                for (int j = 0; j < CCG_TP; j++) {
+                    const float4 y = *(const float4 *)(Vt + (size_t)j * hd + d0);
+                    #pragma unroll
+                    for (int h = 0; h < G; h++) {
+                        const float w = P[((size_t)wp * G + h) * CCG_TP + j];
                         acc[h][0] += w * y.x; acc[h][1] += w * y.y; acc[h][2] += w * y.z; acc[h][3] += w * y.w;
                     }
                 }
@@ -304,6 +483,7 @@ __global__ static void ccg_relattn_qt_k(const float *__restrict__ q, const void 
         __syncthreads();
     }
     if (s < p.S && d0 < hd) {
+        #pragma unroll
         for (int h = 0; h < G; h++) {
             const float inv = l[h] > 0.f ? 1.f / l[h] : 0.f;
             float *orow = o + p.o_off + (long)s * p.o_row + (long)(kvh * G + h) * hd + d0;
@@ -413,10 +593,64 @@ static int cc_sconv(CcBuf *x, CcBuf *w, CcBuf *ring, const CcSconv *p) {
     coli_launch(ccg_sconv_k, g, 64, 0, c->stream, fpw(x), p->mode == 0 ? fp(w) : fp(x), p->mode == 0 ? fpw(ring) : fpw(x), *p);
     return launched(c, "sconv");
 }
+/* the prompt path's launch, one instantiation a G (its kernel's shared memory opt-in) */
+template <int G>
+static int cc_qt_launch(const float *q, const void *kc, const void *vc, float *o, const float *kvs,
+                        const float *r, const float *relp, const float *tau, const CcRelAttn &p,
+                        dim3 g, size_t sm, cudaStream_t st) {
+    static int attr = -1;
+    if (attr < 0)
+        attr = cudaFuncSetAttribute(ccg_relattn_qt_t<G>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    96 * 1024) == cudaSuccess ? 1 : 0;
+    if (!attr) return 0;
+    coli_launch(ccg_relattn_qt_t<G>, g, 256, sm, st, q, kc, vc, o, kvs, r, relp, tau, p);
+    return 1;
+}
+/* COLI_CUDA_RELATTN_GQA=0: the decode step's old walk (a block a (query head, row), the same rows
+ * read and dequantized G times) */
+static int cc_relattn_gqa(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_RELATTN_GQA"); on = !(e && *e == '0'); }
+    return on;
+}
+/* the GQA path's partials, kept (a 250K step's are ~100 MiB; a cudaMallocAsync a call was 65 MiB
+ * a layer before) */
+static float *cc_relattn_part(size_t bytes) {
+    static CcBuf *b; static size_t cap;
+    if (cap < bytes) { cc_free(b); b = cc_buf(bytes, CC_DEV); cap = b ? bytes : 0; }
+    return b ? (float *)(void *)fp(b) : nullptr;
+}
 static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBuf *r, CcBuf *relp, CcBuf *tau, const CcRelAttn *p) {
     CcCtx *c = live();
     if (!c || !p || p->hd > 256 || p->hd < 1 || p->d_rel > 64 || p->d_rel < 0 || p->KVH < 1 || p->H % p->KVH || p->cap < 1) return 0;
     if (p->S <= 0) return 1;
+    /* the decode step, GQA-shared: one block a (KV head, tile), the tile's K/V read and dequantized
+     * once a KV head and every query head of it reading them (P3 of PLAN-colibri.md) */
+    {
+        const int G = p->H / p->KVH;
+        if (cc_relattn_gqa() && p->S <= 8 && p->H % p->KVH == 0 && G >= 1 && G <= 8 && p->hd >= 4 &&
+            p->hd <= 128 && (p->hd & 3) == 0 && p->kv_type >= 0 && p->kv_type <= 3) {
+            const int nmax = p->window > 0 ? p->window : p->pos_base + p->S;
+            const int nc = (nmax + CCG_DTB - 1) / CCG_DTB;   /* a partial a block of CCG_DTB positions */
+            const size_t sm = ((size_t)(p->hd >> 2) * CCG_DTS * 4 + (size_t)CCG_DTS * p->hd +
+                               (size_t)G * p->S * p->hd + (size_t)G * CCG_DTS) * sizeof(float);
+            const size_t pb = (size_t)p->S * p->H * nc * (p->hd + 2) * sizeof(float);
+            static int attr = -1;
+            if (attr < 0)
+                attr = cudaFuncSetAttribute(ccg_relattn_dec_k, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            96 * 1024) == cudaSuccess ? 1 : 0;
+            float *part = attr ? cc_relattn_part(pb) : nullptr;
+            if (part && nc >= 1 && sm <= 96 * 1024) {
+                const int nthr = G <= 4 ? 128 : 256;
+                coli_launch(ccg_relattn_dec_k, dim3((unsigned)p->KVH, (unsigned)nc), nthr, sm, c->stream,
+                            fp(q), (const void *)fp(kc), (const void *)fp(vc), fp(kvs), fp(r), fp(relp), fp(tau), *p, part, nc);
+                coli_launch(ccg_relattn_join_k, dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream,
+                            (const float *)part, fp(tau), fpw(o), *p, nc);
+                return launched(c, "relattn gqa");
+            }
+            (void)cudaGetLastError();
+        }
+    }
     /* a decode step's rows (up to 8): each (head, row)'s positions split over blocks of a tile each, then joined
      * (COLI_CUDA_RELATTN_SPLIT=0: a block a (head, row) over every tile). Inkling-2-Mini Q4_K_XL at about 650
      * positions on an RTX PRO 4000: a block a head ran its tiles one after another */
@@ -444,16 +678,19 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
                            (size_t)CCG_TP * p->hd + (size_t)CCG_QT * G * CCG_TP) * sizeof(float);
         if (p->S >= want && want > 1 && G >= 1 && G <= 8 && p->hd <= 128 && (p->hd & 3) == 0 &&
             sm <= 96 * 1024 && p->kv_type >= 0 && p->kv_type <= 3) {
-            static int attr = -1;
-            if (attr < 0)
-                attr = cudaFuncSetAttribute(ccg_relattn_qt_k, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            96 * 1024) == cudaSuccess ? 1 : 0;
-            if (attr) {
-                dim3 g((unsigned)p->KVH, (unsigned)((p->S + CCG_QT - 1) / CCG_QT));
-                coli_launch(ccg_relattn_qt_k, g, 256, sm, c->stream, fp(q), (const void *)fp(kc), (const void *)fp(vc),
-                            fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p);
-                return launched(c, "relattn qt");
+            const dim3 g((unsigned)p->KVH, (unsigned)((p->S + CCG_QT - 1) / CCG_QT));
+            int on = 0;
+            switch (G) {
+            case 1: on = cc_qt_launch<1>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            case 2: on = cc_qt_launch<2>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            case 3: on = cc_qt_launch<3>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            case 4: on = cc_qt_launch<4>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            case 5: on = cc_qt_launch<5>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            case 6: on = cc_qt_launch<6>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            case 7: on = cc_qt_launch<7>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
+            default: on = cc_qt_launch<8>(fp(q), (const void *)fp(kc), (const void *)fp(vc), fpw(o), fp(kvs), fp(r), fp(relp), fp(tau), *p, g, sm, c->stream); break;
             }
+            if (on) return launched(c, "relattn qt");
             (void)cudaGetLastError();
         }
     }

@@ -1560,6 +1560,11 @@ cuda-k3c-check: backend_cuda.o cuda_chain.o
 cuda-inkc-check: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/test_cuda_inkc.cu -o cuda_inkc_test$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 	./cuda_inkc_test$(EXE)
+# Inkling-2's attention kernels alone (cuda_inkc.cuh), against a synthetic cache at a served
+# context: ms, GB/s and effective FLOP/s for the decode step and a prompt chunk (P0a of
+# PLAN-colibri.md). ./cuda_inkc_bench [ctx] [rows] [reps] [kvtype]; rows 0 = a decode step.
+cuda-inkc-bench: backend_cuda.o cuda_chain.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/bench_cuda_inkc.cu -o cuda_inkc_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 # DFlash2's drafter's convolution on the CUDA chain (cuda_dflash.cuh) against the CPU's arithmetic.
 cuda-dflash-check: backend_cuda.o cuda_chain.o

@@ -4113,6 +4113,51 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out,
     if (df) fclose(df);
 }
 
+/* INK_KV_STATS: the host cache's decoded range and its block scales, sampled over every state
+ * layer's rows. P0b of PLAN-colibri.md: the tensor-core path wants K and V in a 16-bit input, and
+ * ink_kv.h already warns that a q4 block scale (`amax/7`) can pass f16's 65504; this says whether
+ * the values themselves can, before a kernel is written for it. */
+static void ink_kv_stats(const Model *m) {
+    const char *e = getenv("INK_KV_STATS");
+    if (!e || !*e || *e == '0' || !m->K || !m->V) return;
+    const Cfg *c = &m->c;
+    const int type = m->kv_type;
+    double kmax = 0, vmax = 0, ksc = 0, vsc = 0;
+    long over = 0, vals = 0;
+    int hdmax = 1;
+    for (int i = 0; i < c->n_state; i++) if (L_HD(c, i) > hdmax) hdmax = L_HD(c, i);
+    float *buf = malloc(sizeof(float) * (size_t)hdmax);
+    if (!buf) return;
+    for (int i = 0; i < c->n_state; i++) {
+        const int hd = L_HD(c, i), KV = L_KV(c, i);
+        const int cap = kv_ring_rows(c, i, m->kv_len > 0 ? m->kv_len : m->max_t);
+        if (cap <= 0) continue;
+        const size_t rb = ink_kv_row_bytes(type, hd);
+        const long rows = (long)KV * cap, stride = rows > 200000 ? rows / 200000 : 1;
+        for (long r = 0; r < rows; r += stride) {
+            const void *kr = (const char *)m->K[i] + (size_t)r * rb;
+            const void *vr = (const char *)m->V[i] + (size_t)r * rb;
+            ink_kv_get(type, buf, kr, hd);
+            for (int d = 0; d < hd; d++) { float a = fabsf(buf[d]); if (a > kmax) kmax = a; if (a > 65504.f) over++; vals++; }
+            ink_kv_get(type, buf, vr, hd);
+            for (int d = 0; d < hd; d++) { float a = fabsf(buf[d]); if (a > vmax) vmax = a; if (a > 65504.f) over++; vals++; }
+            if (type == INK_KV_Q4 || type == INK_KV_Q8) {
+                const size_t blk = type == INK_KV_Q4 ? 20 : 36;
+                for (size_t off = 0; off + 4 <= rb; off += blk) {
+                    float k, v;
+                    memcpy(&k, (const char *)kr + off, 4); memcpy(&v, (const char *)vr + off, 4);
+                    if (fabsf(k) > ksc) ksc = fabsf(k);
+                    if (fabsf(v) > vsc) vsc = fabsf(v);
+                }
+            }
+        }
+    }
+    fprintf(stderr, "[kvstats] %s cache: max |K| %.4g, max |V| %.4g, block scale max K %.4g V %.4g, "
+                    "%.4g%% of %ld values would not fit f16 (>65504)\n",
+            ink_kv_name(type), kmax, vmax, ksc, vsc, vals ? 100.0 * (double)over / (double)vals : 0.0, vals);
+    free(buf);
+}
+
 /* ---------- interactive prompt mode: greedy, streaming, stop on eos ---------- */
 static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
                             const uint8_t *dmel, int naud) {
@@ -4121,6 +4166,10 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     int *ids = malloc(cap * sizeof(int));
     int np = tok_encode(T, prompt, (int)strlen(prompt), ids, cap);
     if (np <= 0) { fprintf(stderr, "empty prompt after tokenization\n"); return; }
+    {   /* INK_IDS_DUMP: the prompt's token ids as int32, the oracle harness's own input (P0c) */
+        const char *idd = getenv("INK_IDS_DUMP");
+        if (idd && *idd) { FILE *f = fopen(idd, "wb"); if (f) { fwrite(ids, sizeof(int), (size_t)np, f); fclose(f); } }
+    }
     if (audio_tok_count(m, ids, np) != naud) {
         fprintf(stderr, "audio frames (%d) do not match <|audio|> placeholders (%d)%s\n",
                 naud, audio_tok_count(m, ids, np),
@@ -4193,6 +4242,7 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
     printf("[phases] fill %.1fs | expert-mm %.1fs | shared %.1fs | attn %.1fs | other %.1fs\n",
            m->t_fill, m->t_expert, m->t_shared, m->t_attn,
            wall - m->t_fill - m->t_expert - m->t_shared - m->t_attn);
+    ink_kv_stats(m);
 #ifdef COLI_VULKAN
     fflush(stdout); ink_vk_report(); ink_vk_tier_report(m, "run"); inkc_report(m);
 #elif defined(COLI_CUDA)
