@@ -613,8 +613,8 @@ static int cc_relattn_gqa(void) {
     if (on < 0) { const char *e = getenv("COLI_CUDA_RELATTN_GQA"); on = !(e && *e == '0'); }
     return on;
 }
-/* the GQA path's partials, kept (a 250K step's are ~100 MiB; a cudaMallocAsync a call was 65 MiB
- * a layer before) */
+/* the GQA path's partials, kept (a 250K step's are ~26 MiB; a cudaMallocAsync a layer was 65 MiB
+ * before) */
 static float *cc_relattn_part(size_t bytes) {
     static CcBuf *b; static size_t cap;
     if (cap < bytes) { cc_free(b); b = cc_buf(bytes, CC_DEV); cap = b ? bytes : 0; }
@@ -668,7 +668,7 @@ static int cc_relattn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *kvs, CcBu
         }
         (void)cudaGetLastError();
     }
-    /* a prompt chunk: a tile of query rows a block, K/V read once a tile (ccg_relattn_qt_k).
+    /* a prompt chunk: a tile of query rows a block, K/V read once a tile (ccg_relattn_qt_t).
      * COLI_CUDA_RELATTN_QT: 0 the per-(head,row) kernel, unset rows from CCG_QT. */
     {
         const char *e = getenv("COLI_CUDA_RELATTN_QT");

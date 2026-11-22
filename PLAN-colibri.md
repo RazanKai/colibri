@@ -383,10 +383,11 @@ under `/var/tmp/scratch/kvtest/`.
 
 Measured (`cuda_inkc_bench`, q4, 250K, a 1024-row chunk against the full prefix):
 
-| shape | before | after | |
+| shape | before (the old kernel) | after | |
 |---|---:|---:|---:|
-| H=64 (same shape both) | 8511 ms, 1.03 TFLOP/s | **1425 ms, 6.16 TFLOP/s** | 5.97× |
-| H=24 (Mini) | 1.03 TFLOP/s (same kernel, per-row rate) | **656 ms, 5.02 TFLOP/s** | 4.9× the rate |
+| H=64, 250K, 1024 rows (the bench's default shape, both kernels) | 8511 ms, 1.03 TFLOP/s | **1425 ms, 6.16 TFLOP/s** | 5.97×, measured |
+| H=24 (Mini), 250K, 1024 rows | not measured (the old kernel is gone from the tree) | **656 ms, 5.02 TFLOP/s** | — |
+| H=24 (Mini), 64K, 1024 rows | not measured | **163 ms, 5.03 TFLOP/s** | — |
 
 ### 14.3 P3 — the decode step, GQA-shared
 

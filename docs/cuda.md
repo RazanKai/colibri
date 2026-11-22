@@ -313,7 +313,13 @@ things the Small's runs did not have:
   host's step, as do TOPP and `ROUTE_TRACE`; `COLI_CUDA_CHAIN_MOE=0` sends every layer there;
 - the attention of a decode step split over its positions (`COLI_CUDA_RELATTN_SPLIT`, on): a
   block a tile of 128 positions for each (head, row), then a join in tile order. A block a head
-  walked every tile alone before, with only the heads' blocks on the card.
+  walked every tile alone before, with only the heads' blocks on the card. `COLI_CUDA_RELATTN_GQA`
+  (on) is the better shape at long context: a block a (KV head, 128 positions), the tile's K and
+  V dequantized once a KV head for all its query heads and an online softmax across 32-position
+  pieces, so the mirror is read and widened once a KV head instead of once a query head;
+- a prompt chunk's attention (`COLI_CUDA_RELATTN_QT`) a tile of 8 query rows a block, one
+  instantiation a query-head group: the K tile transposed on its `float4` (conflict-free), read
+  once for every query head, and the V `float4` loaded once a position for all of them.
 
 A backend from before these ops (`cc_ink2_caps`) leaves the Mini on the per-matrix path. Measured
 on an RTX PRO 4000 Blackwell (24 GB, every expert of the model on the card), `coli serve`, about
