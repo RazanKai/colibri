@@ -1,0 +1,49 @@
+[
+ {
+  "kind": "needle3",
+  "target_k": 8,
+  "wall_s": 11.6,
+  "prompt_n": 8795,
+  "prompt_per_second": 834.4,
+  "predicted_n": 28,
+  "predicted_per_second": 29.8,
+  "draft_n": 36,
+  "draft_n_accepted": 22,
+  "facts": {
+   "7X4Q-ALPHA-93": true,
+   "PUMP-41-BRAVO-77": true,
+   "K9-ORBIT-27": true
+  },
+  "found": 3,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27"
+ },
+ {
+  "kind": "needle3",
+  "target_k": 56,
+  "wall_s": 131.4,
+  "prompt_n": 61016,
+  "prompt_per_second": 492.6,
+  "predicted_n": 28,
+  "predicted_per_second": 3.8,
+  "draft_n": 0,
+  "draft_n_accepted": 0,
+  "facts": {
+   "7X4Q-ALPHA-93": true,
+   "PUMP-41-BRAVO-77": true,
+   "K9-ORBIT-27": true
+  },
+  "found": 3,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27"
+ },
+ {
+  "kind": "plain64k",
+  "wall_s": 114.0,
+  "prompt_n": 63992,
+  "prompt_per_second": 656.8,
+  "predicted_n": 56,
+  "predicted_per_second": 3.4,
+  "draft_n": 0,
+  "draft_n_accepted": 0,
+  "content_head": "The quick brown fox jumps over the lazy dog. In a mixture-of-experts transformer, the router sends each token to a small set of experts while the rest stay resi"
+ }
+]

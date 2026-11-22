@@ -1,0 +1,20 @@
+[
+ {
+  "kind": "needle3",
+  "target_k": 1,
+  "wall_s": 4.3,
+  "prompt_n": 1161,
+  "prompt_per_second": 760.0,
+  "predicted_n": 28,
+  "predicted_per_second": 10.3,
+  "draft_n": 0,
+  "draft_n_accepted": 0,
+  "facts": {
+   "7X4Q-ALPHA-93": true,
+   "PUMP-41-BRAVO-77": true,
+   "K9-ORBIT-27": true
+  },
+  "found": 3,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27"
+ }
+]

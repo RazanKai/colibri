@@ -674,6 +674,50 @@ silently loses the far facts. Keep the prompt under the limit, or make the harne
 (the harness now targets 244K). The 250K headline stays the 250,156-token single-code run of §15;
 this cell adds depth and type coverage at 244K.
 
+## 15.8 Strata SQ-10 cross-check (the same model, a different engine and quant)
+
+Strata 0.2.20 / engine 0.1.66 for `inkling-2-mini`, pack `Inkling-2-Mini-SQ-10.strata`
+(10.5 GB, SQ-10) from `strata-engine/Inkling-2-Mini-Strata`, installed under
+`/run/media/nazar/Gaaaymes/models/strata` and served on `127.0.0.1:8080`:
+
+```bash
+strata update --yes
+strata launch --family inkling-2-mini --model sq-10 \
+  --data-dir /run/media/nazar/Gaaaymes/models/strata --context 64k --vision off \
+  --tune skip --no-tui --no-api-key --yes
+python3 bench/strata_test.py --tokens 8,56 --plain-64k     # rows in bench/results-strata*.json
+```
+
+`bench/strata_test.py` sends the same three-fact prompt as §15.7 (vault code at 10%, pump
+serial at 50%, cipher key at 90%) through `/v1/chat/completions` and reads the server's own
+timings. **Retrieval is 3 of 3 at every size tested** (1K, 8K, 30K, 61K, 64K), so SQ-10 reads
+depth and fact type like the colibri path.
+
+| served ctx | prompt n | prompt tok/s | decode tok/s | DSpark draft/accepted |
+|---|---:|---:|---:|---:|
+| 32K | 1,161 | 760 | 10.3 | 0 / 0 |
+| 32K | 8,795 | 898 | 41.9 | 36 / 22 |
+| 32K | 30,617 | 825 | 5.9 | 0 / 0 |
+| 64K | 8,795 | 834 | 29.8 | 36 / 22 |
+| 64K, q4 KV | 61,016 | 621 | 3.9 | 0 / 0 |
+| 64K, q4 KV | 63,992 | 684 | 3.5 | 0 / 0 |
+| 64K, int8 KV | 61,016 | 493 | 3.8 | 0 / 0 |
+| 64K, int8 KV | 63,992 | 657 | 3.4 | 0 / 0 |
+
+At 64K the engine allocated 2609 experts in VRAM (6.86 GiB), **463 experts SSD-only**, trunk
+1.87 GB, and offloaded most KV to host (global KV 2304 VRAM + 63,232 mapped host tokens,
+1.98 GiB RAM); `--kv q4_0` moved only the VRAM share (2304 tokens) and did not change the
+decode rate. DSpark was active on the first request after each start (36 drafted / 22 accepted
+at 8K) and reported `draft_n=0` on later/long-context requests. The card's RTX 5070 figure
+(93.9–101.4 tok/s) did not reproduce here: 41.9 tok/s was the best (8K under the 32K setting),
+and long context collapses to 3.4–5.9 tok/s once the pack, the desktop and the KV do not fit.
+
+**Comparison with this tree at 64K** (different quant and KV: SQ-10 10.5 GB vs IQ3_XXS 11.66 GB
+q4): Strata prompt **657–684 vs 253–258 tok/s** (2.6–2.7× faster), decode **3.4–3.5 vs
+17.8–18.1 tok/s** (about 5× slower). So on this 12 GB card the Strata pack is a prompt-speed
+win and a long-context-decode loss, the opposite trade from the colibri tier; it is not a
+quality comparison (SQ-10 is 89.8–92.4% same-next-word to the original on the pack's own tests).
+
 ## Appendix — benchmark commands
 
 ```bash
