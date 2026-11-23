@@ -1004,6 +1004,16 @@ The pair at 64K, same prompt (`needle_depth.build` at 64,000 tokens, the three f
 The timing prompt (`bench/prompt-64k.txt`, the published baseline's own) with the path on:
 **156.4 s**, phases 0.5 / 55.2 / 101.5, decode 17.07 tok/s, 3,024 layer-steps in the frame.
 
+**The default path on this tree, the same timing prompt, nothing set** (the flag off, the pool off):
+265.1 s prefill, phases 2.9 / 136.6 / 78.3 / 49.1, decode 17.27 tok/s, RSS 8.8 GB, budget 7.49 GiB
+= 2,305. That is **+6.9% prefill and −2% decode against the published 248.0 s / 17.77–18.09**
+(commit `b1f0c26`, the night before), and it is not the flag: with it off the path is the old one
+byte for byte (`ink2cc_prompt_moe()` short-circuits before any allocation, `vram_need` keeps the
+8-row estimate, `dm_onp` is never set, and the tile epilogue's new arguments default to the old
+arithmetic for the dense GEMMs). It is either the eight commits between `b1f0c26` and `e1470cd` or
+the box (page cache, thermals) — **unattributed**, and a re-baseline of `b1f0c26` is the way to
+settle it. The A/B above is unaffected: both arms ran tonight on this tree.
+
 **Gates (all measured, this tree, the path on).** `bench/gate.sh` green: `cuda-inkc-check` all
 green and the needle 4/4 at 1K/2K/4K/8K through the new path; `needle_check` 1K/4K/8K/16K all found
 with the path and with `COLI_CUDA_CHAIN_MOE=0`; `needle_depth --tokens 64000` **3 of 3 both ways**

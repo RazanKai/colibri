@@ -71,6 +71,21 @@
   "consequence": "the path's requirement is that every expert of a layer be present: the VRAM residents plus a host pool big enough for the rest. At a 64K-served context that is 2,150 + 922 = 3,072 with 3.0 GiB of pinned RAM; at a 262K-served context the engine's KV/state leave ~1.5 GiB to the pool, so the path declines. A 250K run would need either a larger pool (RAM) or the per-step staging copies instead of the pool."
  },
  {
+  "cell": "default-path-64k",
+  "question": "The same timing prompt with nothing set (the flag off, the host pool off): is the default path on this tree what the published baseline measured?",
+  "commit": "dbfe4cb",
+  "provenance": "measured",
+  "command": "as the timing cell, without COLI_VK_TIER_HOST and without COLI_CUDA_CHAIN_PROMPT_MOE",
+  "log": "/var/tmp/scratch/opencode/colibri-runs/engine-64k-default-dbfe4cb.log",
+  "prefill_s": 265.1,
+  "phases_s": {"fill": 2.9, "expert_mm": 136.6, "attn": 78.3, "other": 49.1},
+  "decode_tune": {"tokens": 31, "s": 1.795, "tok_s": 17.27},
+  "rss_gb": 8.8,
+  "budget": {"gib": 7.49, "experts": 2305},
+  "compare": "the published 64K baseline (commit b1f0c26, bench/results-whole.json) is 248.0 s / 17.77-18.09 tok/s: this tree's default path is +6.9% prefill and -2% decode on the same prompt and settings",
+  "attribution": "not the flag (with it off the path is unchanged by construction: ink2cc_prompt_moe() short-circuits before any allocation, vram_need keeps the 8-row estimate, dm_onp is never set, and the tile epilogue's new arguments default to the old arithmetic for NW==1). Either the eight commits between b1f0c26 and e1470cd or the box (page cache, thermals). Unattributed; a re-baseline at b1f0c26 settles it. The A/B pair above is unaffected (both arms ran tonight on this tree)."
+ },
+ {
   "cell": "prompt-moe-decision",
   "provenance": "derived from the measured pair above",
   "decision": "the chosen path is implemented behind COLI_CUDA_CHAIN_PROMPT_MOE (default 0) and measured at 64K: prefill 267.0 -> 162.0 s on the same prompt and context (-39%), decode 12.94 -> 12.27 tok/s (-5%), the 3-fact needle 3/3 both ways. Against the published 64K baseline of 248.0 s / 17.77-18.09 tok/s (host pool off, another commit and prompt), the path plus its pool is 156.4 s on the timing prompt (-37%) with decode 17.07 tok/s: the pool is what costs decode (the tier copies pooled experts into its slots), not the prompt tiles",
