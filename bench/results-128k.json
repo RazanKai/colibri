@@ -1,0 +1,45 @@
+[
+ {
+  "cell": "engine-128k",
+  "question": "The engine's 128K cell: prefill, decode, phases and the three-fact needle at 128K (the depth work had cells at 8K and 244K only).",
+  "commit": "a2f79b1",
+  "provenance": "measured",
+  "command": "SNAP=/run/media/nazar/Gaaaymes/models/Inkling-2-Mini-GGUF/iq3xxs.colibri CTX_MAX=140000 INK2_KV=q4 COLI_CUDA=1 OMP_NUM_THREADS=6 ./c/inkling -f bench/prompt-128k.txt -n 32",
+  "box": "RTX 5070 12 GB sm_120, i5-10400F, 23 GB RAM, CUDA 13.4; one GPU process",
+  "prompt": "bench/prompt-128k.txt, a local artifact like the other prompts (not tracked): needle_depth.build(int(128000*5.52), random.Random(11)) written on one line, 706,745 chars",
+  "prompt_tokens": 128033,
+  "ctx_max": 140000,
+  "kv": "q4",
+  "log": "/var/tmp/scratch/opencode/colibri-runs/engine-128k-a2f79b1.log",
+  "prefill_s": 697.8,
+  "prefill_tok_s": 183.5,
+  "phases_s": {"fill": 5.9, "expert_mm": 307.3, "shared": 0.0, "attn": 283.0, "other": 103.9},
+  "decode_tokens": 32,
+  "decode_s": 2.2,
+  "decode_tok_s": 13.87,
+  "tune": {"tokens": 31, "s": 2.236},
+  "rss_gb": 9.8,
+  "device_mib": 1733.8,
+  "budget": {"gib": 6.66, "of_gib": 6.8, "experts": 2084, "blocks": 28, "frag": 0.97},
+  "tier": "99.8% of 53,549,568 routed experts served; uploads 5,415 (17.29 GiB); evictions 3,331; device 177.1 s, CPU share 65.1 s, waited 99.9 s (44% of device time hidden); stream 6,576 steps, 41.17 GiB at 4.03 GB/s, 44,366 cold experts kept on the CPU",
+  "chain": {"host_ms": 377106.2, "dm_layers": 0, "frames": 8262, "wait_ms": 260753.7},
+  "needle": {
+   "facts": ["7X4Q-ALPHA-93 (10%)", "PUMP-41-BRAVO-77 (50%)", "K9-ORBIT-27 (90%)"],
+   "generation": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27.",
+   "found": 3,
+   "of": 3,
+   "note": "verbatim, in the asked order; the facts appear once in the prompt and once in the generation, so the echo is excluded from the count"
+  },
+  "decode_parity_note": "the engine decodes at 13.87 tok/s at 128K (17.77-18.09 at 64K, 12.22 at 250K): monotone and expected; there is no llama.cpp cell to compare with (see engine-128k-llamacpp)"
+ },
+ {
+  "cell": "engine-128k-llamacpp",
+  "question": "The missing 128K/250K decode-parity cell: can the reference (llama.cpp b12588, the 64K cell's settings) serve 128K on this box?",
+  "provenance": "measured",
+  "command": "python3 /var/tmp/scratch/llama128.py  ->  llama-server -m Inkling-2-Mini-UD-IQ3_XXS.gguf -ngl 99 --n-cpu-moe 12 -c 131072 -ctk q4_0 -ctv q4_0 -fa on -b 512 -ub 128 --parallel 1",
+  "settings": "the §15.6 (DSpark gate) cell's, unchanged: ngl 99, --n-cpu-moe 12, q4_0 K/V, -fa on, -b 512 -ub 128, temp 0, cache_prompt=false, 32 tokens",
+  "log": "/var/tmp/scratch/opencode/colibri-runs/dspark-128K-nomd.log",
+  "result": "failed to load: 'graph_reserve: failed to allocate compute buffers' (3,522,582,912 bytes) then 'failed to initialize the context: failed to allocate compute pp buffers' on an RTX 5070 12 GB with 10.9 GiB free",
+  "consequence": "the 250K decode-parity cell is not merely unmeasured, it is not obtainable on this box with the reference's 64K settings: at 128K the -c 131072 context needs a compute buffer the card does not have beside 12 layers' experts on the CPU. The engine loads and serves the same 128K at 13.87 tok/s with 9.8 GB RSS. A reference cell would need more experts on the CPU (a different setting, so no longer like-for-like); recorded as still open rather than run that way."
+ }
+]

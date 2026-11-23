@@ -944,6 +944,36 @@ expert path (99 s by §15.11) and the ~163 s of other device work are the floor.
 Provenance: ms, TFLOP/s and GB/s measured; the 4.3× and the ~168 s are derived from them. The
 kernel is not written; P5 and P1.2 stay open in §14.10.
 
+## 15.13 The 128K cell, and why there is no 250K reference cell
+
+One engine cell at 128K on the same tree (the depth prompt of §15.7 generated at 128K tokens, the
+three facts at 10/50/90%), `bench/results-128k.json`, commit `a2f79b1`:
+
+| | 64K (14.8) | **128K** | 250K (14.9) |
+|---|---:|---:|---:|
+| prompt tokens | 63,977 | **128,033** | 250,156 |
+| prefill | 248.0 s | **697.8 s** (183.5 tok/s) | 1,678.0 s |
+| phases (s) | 127.0 / 71.9 / 47.5 | **expert 307.3 / attn 283.0 / other 103.9** | 658.1 / 836.4 / 180.1 |
+| decode | 17.77–18.09 tok/s | **13.87 tok/s** | 12.22 tok/s |
+| RSS | 9.7 GB | **9.8 GB** | 12.8 GB |
+| tier | 7.47 GiB = 2,296 | **6.66 GiB = 2,084** | 5.71 GiB = 1,741 |
+| needle | — | **3 of 3** | 3 of 3 (244K) |
+
+The generation at 128K is verbatim `7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27.` — a third depth
+cell between the 8K and 244K ones, so retrieval holds across the range, not only at the ends.
+Prefill is sublinear per token (3.9 s/1K at 64K, 5.4 at 128K, 6.7 at 250K) and the phases scale
+the way §14.9/15.4 said they would: the expert phase tracks tokens, attention more than tracks them.
+Decode 13.87 sits between the 64K and 250K numbers, monotone in context.
+
+**The reference cannot make the same cell.** llama-server with the §15.6 settings unchanged
+(`-ngl 99 --n-cpu-moe 12 -c 131072 -ctk q4_0 -ctv q4_0 -fa on -b 512 -ub 128`) fails to load:
+`graph_reserve: failed to allocate compute buffers` (3.52 GB) and then `failed to initialize the
+context: failed to allocate compute pp buffers`, on the same card with 10.9 GiB free. So the
+missing 250K comparison is not an omission: at 128K the reference needs a compute buffer the 12 GB
+card does not have beside twelve layers' experts on the CPU. Getting a reference number would need
+more experts on the CPU (`--n-cpu-moe` up), which changes the setting and so stops being
+like-for-like. **250K decode parity stays open, with its reason measured.**
+
 ## Appendix — benchmark commands
 
 ```bash
@@ -1229,8 +1259,11 @@ Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-n
   with the vectorized unpack (P5's arithmetic) and the CPU-reference/oracle gates.
 - **P5, the vectorized q4/q8 block packer**: ~62 s at 250K in `ink2cc_kv_down`; not done. It is
   also the unpack that P1.2 needs, so the two are one change.
-- **250K decode parity**: llama.cpp was compared only at 8K/64K (§15.6). There is no 250K cell, so
-  "decode work dropped" is established only to 64K.
+- **250K decode parity**: llama.cpp was compared only at 8K/64K (§15.6). The engine now has a
+  128K cell (§15.13: prefill 697.8 s, decode 13.87 tok/s, needle 3/3), but the reference cannot
+  make one: llama-server with the §15.6 settings fails to allocate its 3.52 GB compute buffer for
+  a 131,072-token context on this card. A reference cell needs `--n-cpu-moe` raised, i.e. a
+  different setting; recorded as open with that reason.
 - **Transfer timeline**: the prefetch-ordering statement is a code reading, not a measured
   timeline; confirm it before calling it the cause of the 11–17% overlap.
 - **M3/M4**: 1M is YaRN-only and out of scope for the 262K acceptance. The 1M requirement is
