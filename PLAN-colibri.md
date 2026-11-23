@@ -916,6 +916,34 @@ Four things the table does not say on its own, and that the cells measured:
    them; it needs a filtered host pair step, so the streaming path (§15.10's "if it passes") is
    what gets prototyped first.
 
+## 15.12 The q4 attention kernel's limiter, measured (P1.2's gate, no kernel yet)
+
+PLAN 14 asks the tensor-core item to start by measuring the dequant limiter instead of porting
+`mma` on a hunch. `cuda_inkc_bench` on this tree, 262,144 positions, one layer, a 1,024-row chunk
+at the end of the context (the widest chunk; a prefill's 244 chunks average about half of it),
+`bench/results-tensor-core.json`:
+
+| KV type | ms | TFLOP/s | mirror read | GB/s |
+|---|---:|---:|---:|---:|
+| f32 | 1111.7 | 2.96 | 255.0 GiB | **246.3** |
+| f16 | 1132.6 | 2.91 | 127.5 GiB | 120.9 |
+| q8 | 839.8 | 3.92 | 71.7 GiB | 91.7 |
+| q4 | 729.6 | 4.51 | 39.8 GiB | **58.6** |
+
+The decode step over the same prefix: 3.68 ms at q4 (0.87 TFLOP/s), 6.40 ms at f16.
+
+**Reading.** q4 reads 6.4× fewer bytes than f32 and takes 34% less time, so the bytes are not what
+limits the q4 kernel: at f32 it reaches 246 GB/s (the card's own read rate) while at q4 it reaches
+58.6 GB/s. About four fifths of the q4 kernel's time is the unpack, not the loads and not the
+FMAs: the bandwidth ceiling for 39.8 GiB is ~0.17 s against a measured 0.73 s, a 4.3× headroom.
+So the tensor-core item's premise is measured, not assumed, and its condition stands: `mma` only
+with a vectorized unpack in the same change. At the engine's 250K cell the attention kernel is
+~673 s of the 836 s device side (14.9); a 4× kernel would leave ~168 s, at which point the
+expert path (99 s by §15.11) and the ~163 s of other device work are the floor.
+
+Provenance: ms, TFLOP/s and GB/s measured; the 4.3× and the ~168 s are derived from them. The
+kernel is not written; P5 and P1.2 stay open in §14.10.
+
 ## Appendix — benchmark commands
 
 ```bash
@@ -1194,19 +1222,28 @@ Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-n
 - **A hybrid instead of streaming** (device the residents, the host its non-resident pairs) is
   10 s better at 64K by the microbench's tiles-only cell, and cheaper in PCIe (no 369 GiB of
   uploads at 56%); it needs a filtered host pair step (`moe_ex` takes every rank today).
-- **The tensor-core prompt path (P1.2)** is still not written. Its gate is measured: at 250K the
-  kernel is ~566–673 s and the other device work ~200–266 s, so a 2.5× kernel wins ~340–400 s and
-  no more. A naive `mma` port leaves q4 dequant (~1,280 instructions a position per KV head
-  against 768 FMAs) as the limiter; it needs the vectorized unpack in the same change, and the
-  CPU-reference/oracle gates.
-- **P5, the vectorized q4/q8 block packer**: ~62 s at 250K in `ink2cc_kv_down`; not done.
+- **The tensor-core prompt path (P1.2)** is still not written, but its premise is now **measured**
+  (§15.12, `bench/results-tensor-core.json`): at 250K and 1,024 rows the q4 kernel reaches 58.6
+  GB/s where f32 reaches 246 GB/s, i.e. ~4/5 of its 729.6 ms is the unpack, with a 4.3× headroom
+  over the bandwidth ceiling. A naive `mma` port would move the limiter, not remove it; it ships
+  with the vectorized unpack (P5's arithmetic) and the CPU-reference/oracle gates.
+- **P5, the vectorized q4/q8 block packer**: ~62 s at 250K in `ink2cc_kv_down`; not done. It is
+  also the unpack that P1.2 needs, so the two are one change.
 - **250K decode parity**: llama.cpp was compared only at 8K/64K (§15.6). There is no 250K cell, so
   "decode work dropped" is established only to 64K.
 - **Transfer timeline**: the prefetch-ordering statement is a code reading, not a measured
   timeline; confirm it before calling it the cause of the 11–17% overlap.
-- **M3/M4**: 1M is YaRN-only and out of scope for the 262K acceptance — document the 24 GB
-  requirement; upstream the KV type and tiled kernel behind `INK2_KV`/`COLI_CUDA_RELATTN_QT` with
-  docs and tests.
+- **M3/M4**: 1M is YaRN-only and out of scope for the 262K acceptance. The 1M requirement is
+  documented (§7.1–7.3 and `docs/ENVIRONMENT.md`): a q4 mirror is 9.2 GB and f16 32 GB, so a 12 GB
+  card has no 1M device policy — the host-only attention option (§7.2 item 1) is the only one that
+  loads, and **24 GB is the documented 1M configuration**. The upstream PR's body for `INK2_KV` +
+  `COLI_CUDA_RELATTN_QT` is written (`bench/pr-ink2-kv-relattn.md`, with the exact cherry-pick and
+  `gh pr create` lines); it is **not opened**: both knobs are already documented with their
+  measured wins (§14.1/§14.2, `docs/ENVIRONMENT.md`), the tests it cites exist
+  (`cuda-inkc-check`, `test_ink_kv.c`, `gate.sh`), but this branch is a long-lived experimental line
+  (PLAN §1–§15), so a PR from it would ask upstream to review all of it under the title of two
+  knobs. The focused branch is a cherry-pick away and the body names the commits and the
+  `gh pr create` line.
 - **Closed**: the 250K needle (single code and the three-fact/three-depth prompt), the
   whole-layer A/B (rejected as a 250K policy; the in-frame path is decode-only and +3–5% at
   64K), the DSpark 8K/64K price, and the Strata cross-check with its VRAM sweep.

@@ -1,0 +1,30 @@
+[
+ {
+  "cell": "inkc-bench-q4-limiter-250k",
+  "question": "Is the q4 attention kernel at 250K instruction-bound (the dequant) or bandwidth-bound, before any tensor-core work? (PLAN 14.10's tensor-core item, its first step: 'measure the dequant limiter with cuda_inkc_bench')",
+  "bench": "c/tests/bench_cuda_inkc.cu (make -C c cuda-inkc-bench), unchanged",
+  "command": "./c/cuda_inkc_bench <ctx> <rows> <reps> <kvtype>",
+  "commit": "8655842",
+  "provenance": "measured",
+  "box": "RTX 5070 12 GB sm_120, CUDA 13.4; one GPU process at a time",
+  "ctx": 262144,
+  "rows": 1024,
+  "heads": 24,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "chunk_is": "one layer's global attention on a 1,024-row prompt chunk at its end (the widest chunk; the average over a 250K prefill's 244 chunks is about half this)",
+  "cells": [
+   {"kv": "f32", "ms": 1111.73, "tflops": 2.961, "mirror_gib_read": 255.0, "gbps": 246.3},
+   {"kv": "f16", "ms": 1132.60, "tflops": 2.907, "mirror_gib_read": 127.5, "gbps": 120.9},
+   {"kv": "q8", "ms": 839.82, "tflops": 3.920, "mirror_gib_read": 71.7, "gbps": 91.7},
+   {"kv": "q4", "ms": 729.55, "tflops": 4.512, "mirror_gib_read": 39.8, "gbps": 58.6}
+  ],
+  "decode_cells": [
+   {"ctx": 262144, "kv": "q4", "ms": 3.68, "tflops": 0.875, "note": "one decode step over a 250K prefix"},
+   {"ctx": 262144, "kv": "f16", "ms": 6.40, "tflops": 0.503}
+  ],
+  "reading": "q4 reads 6.4x fewer bytes than f32 and takes 34% less time, so the mirror's bytes are not what limits it: at f32 the kernel reaches 246 GB/s (the card's own read rate) while at q4 it reaches 58.6 GB/s, i.e. it spends about four fifths of its time unpacking, not reading. The bandwidth ceiling for q4's 39.8 GiB is ~0.17 s against the measured 0.73 s, so the dequant is the limiter with a 4.3x headroom.",
+  "consequence": "the tensor-core item's premise holds and its gate is now measured: an mma port must ship with a vectorized unpack (as PLAN 14 says), because the unpack, not the loads or the FLOPs, is what the 4.5 TFLOP/s q4 number is made of. At the engine's 250K cell the kernel is ~673 s of the 836 s device side (PLAN 14.9); a 4x kernel would leave ~168 s, and the expert path at the microbench's 99 s would then be the next floor. This is a measurement of the limiter only: no kernel was written.",
+  "next": "the vectorized q4/q8 unpack (P5's arithmetic, an explicit 4-bit LUT-free dequant into 16-bit lanes) and then the mma over the same blocks, gated by the CPU reference (tests/test_cuda_inkc.cu) and the needle"
+ }
+]
