@@ -2993,8 +2993,10 @@ static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf 
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
     if (cc_moe_hid_floats(LS, p->K, p->D, p->I, p->E) * 4 > hid->bytes || (LS > CC_MOE_FRAME_ROWS && p->E < 1)) return 0;
-    /* CC_INK2_MOE's (a decode step's rows; the scales' pairs inside the table's buffer): refused here, not a lost device */
-    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && LS > CC_MOE_FRAME_ROWS) ||
+    /* CC_INK2_MOE's (a decode step's rows; the scales' pairs inside the table's buffer): refused here,
+     * not a lost device. A GGUF's block formats (fmt 100+) take act and esc_off on a prompt chunk's
+     * block tiles as well (backend_cuda.cu's hcg_moe_*_bd_k), so only the int formats are refused */
+    if (p->act < 0 || p->act > 1 || p->esc_off < 0 || ((p->act || p->esc_off) && LS > CC_MOE_FRAME_ROWS && p->fmt < 100) ||
         (p->act == 1 && !(p->act_a > 0.f && p->act_b > 0.f)) ||
         (p->esc_off && (p->esc_off % 8 || p->E < 1 || (size_t)p->esc_off + (size_t)(p->t_off + p->E) * 8 > tab->bytes))) return 0;
     g_st.ops++;

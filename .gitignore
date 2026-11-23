@@ -46,6 +46,8 @@ c/backend_cuda.o
 c/backend_cuda_test
 c/cuda_inkc_bench
 c/cuda_inkc_test
+c/cuda_moe_bench
+c/cuda_moe_bench.exe
 c/backend_loader.o
 c/coli_cuda.dll
 c/coli_cuda.lib

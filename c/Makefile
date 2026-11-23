@@ -1565,6 +1565,12 @@ cuda-inkc-check: backend_cuda.o cuda_chain.o
 # PLAN-colibri.md). ./cuda_inkc_bench [ctx] [rows] [reps] [kvtype]; rows 0 = a decode step.
 cuda-inkc-bench: backend_cuda.o cuda_chain.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/bench_cuda_inkc.cu -o cuda_inkc_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
+# Inkling-2's prompt expert step alone (PLAN-colibri.md §15.10): a 128-expert table in the snapshot's
+# real formats at 75%/56% residency, 1,024 rows, the .coli_usage routing replayed, the cold set
+# uploaded through the chain's staging, one layer-step and the real 36-step sequence.
+# ./cuda_moe_bench [residency %] [steps] [overlap] [contend]
+cuda-moe-bench: backend_cuda.o cuda_chain.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu cuda_chain.cu tests/bench_cuda_moe.cu -o cuda_moe_bench$(EXE) $(ANS_NVCC_LIBS) $(GPU_TEST_LIBS)
 
 # DFlash2's drafter's convolution on the CUDA chain (cuda_dflash.cuh) against the CPU's arithmetic.
 cuda-dflash-check: backend_cuda.o cuda_chain.o

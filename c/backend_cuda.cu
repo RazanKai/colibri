@@ -3828,10 +3828,19 @@ static inline int hcg_bt_wf(int fmt) {
     case 221: K<221><<<grid, 256, 0, st>>>(__VA_ARGS__); break; case 222: K<222><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
     case 223: K<223><<<grid, 256, 0, st>>>(__VA_ARGS__); break; default: K<100><<<grid, 256, 0, st>>>(__VA_ARGS__); break; \
     } } while (0)
+/* the routed experts' activation (CcMoe.act): 0 silu(g) * u; 1 SiTU-GLU with the caps act_a, act_b
+ * (Inkling-2's; inkling.c's ink_glu). Defined above hcg_tile because a prompt chunk's block tiles
+ * apply the same expression the decode step's GEMV kernels do (moe_glu), so a row has one form
+ * whichever path ran it. */
+__device__ __forceinline__ float moe_glu3(int act, float ta, float tb, float g, float u) {
+    if (act == 1) return ta * tanhf(g / ta) * (1.f / (1.f + expf(-g))) * tb * tanhf(u / tb);
+    return (g / (1.f + expf(-g))) * u;
+}
 template<int WF, int NW>
 __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const int *yr, const float *__restrict__ X, int xld, const int *xr,
                                          int M, const uint8_t *const *W, const float *const *sc, int gs, int N, int K, int n0,
-                                         int planar = 0, int kb = 0, int ke = -1) {   /* [kb, ke): a split K's part (-1: K) */
+                                         int planar = 0, int kb = 0, int ke = -1,
+                                         int act = 0, float ta = 1.f, float tb = 1.f, float s_in = 1.f, float s_out = 1.f) {   /* [kb, ke): a split K's part (-1: K) */
 #if HCG_BODY
     using namespace nvcuda;
     constexpr int STG = (1 + NW) * TCG_BM * HCG_LDH * 2, EPI = NW * TCG_BM * (TCG_BN + 4) * 4;   /* bytes */
@@ -3892,11 +3901,13 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
         if (r >= M || nn >= N) continue;
         float g = Cs[r * CL + c];
         if (WF != 4 && WF < 100) g *= sc[0][nn];   /* int8 and int4 rows: the codes went in exact, the row's scale here */
+        if (s_out != 1.f) g *= s_out;              /* down's per-expert scale (CcMoe.esc_off), after its products */
         if (NW == 2) {
             float u = Cs[TCG_BM * CL + r * CL + c];
             if (WF != 4 && WF < 100) u *= sc[NW - 1][nn];
-            g = (g / (1.f + expf(-g))) * u;
-        }
+            if (s_in != 1.f) { g *= s_in; u *= s_in; }   /* gate's and up's per-expert scale, before the activation */
+            g = moe_glu3(act, ta, tb, g, u);
+        } else if (s_in != 1.f) g *= s_in;
         Y[(size_t)yr[r] * yld + nn] = g;
     }
 #else
@@ -5458,12 +5469,8 @@ __device__ __forceinline__ float moe_warp_sum(float v) {
 template<int FMT>
 __device__ __forceinline__ size_t moe_row_bytes(int n) { return FMT == 2 || FMT == 4 ? (size_t)n / 2 : (size_t)n; }
 
-/* the routed experts' activation (CcMoe.act): 0 silu(g) * u; 1 SiTU-GLU with the caps act_a, act_b
- * (Inkling-2's, situ_mul's expression) */
-__device__ __forceinline__ float moe_glu(const CcMoe &p, float g, float u) {
-    if (p.act == 1) return p.act_a * tanhf(g / p.act_a) * (1.f / (1.f + expf(-g))) * p.act_b * tanhf(u / p.act_b);
-    return (g / (1.f + expf(-g))) * u;
-}
+/* the routed experts' activation (CcMoe.act) */
+__device__ __forceinline__ float moe_glu(const CcMoe &p, float g, float u) { return moe_glu3(p.act, p.act_a, p.act_b, g, u); }
 /* entry t_off + e's scales outside its matrices (CcMoe.esc_off: gate's and up's, down's), 1 and 1 without */
 __device__ __forceinline__ float2 moe_esc(const CcExpert *__restrict__ tab, const CcMoe &p, int e) {
     if (p.esc_off <= 0) return make_float2(1.f, 1.f);
@@ -5688,7 +5695,9 @@ __global__ static void __launch_bounds__(256) hcg_moe_gu_bd_k(const CcExpert *__
     CcExpert ex = tab[p.t_off + e];
     const uint8_t *W[2] = {(const uint8_t *)ex.g, (const uint8_t *)ex.u};
     const float *Sc[2] = {reinterpret_cast<const float *>(btab), reinterpret_cast<const float *>(btab)};
-    hcg_tile<WF, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.fmt, p.I, p.D, blockIdx.x * TCG_BN);
+    /* Inkling-2: SiTU-GLU and the expert's gate/up scale (CcMoe.act, esc_off), as the decode kernels apply them */
+    hcg_tile<WF, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.fmt, p.I, p.D, blockIdx.x * TCG_BN,
+                    0, 0, -1, p.act, p.act_a, p.act_b, moe_esc(tab, p, e).x, 1.f);
 }
 template<int WF>
 __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__restrict__ tab, float *__restrict__ hid, MoeSort m, CcMoe p,
@@ -5701,7 +5710,9 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__
     const uint8_t *W[1] = {(const uint8_t *)ex.d};
     const float *Sc[1] = {reinterpret_cast<const float *>(btab)};
     size_t A = (size_t)p.S * p.K;
-    hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN);
+    /* Inkling-2: down's per-expert scale (esc_off), after its products (moe_sum_k's on the decode path) */
+    hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN,
+                    0, 0, -1, 0, 1.f, 1.f, 1.f, moe_esc(tab, p, e).y);
 }
 /* A prompt chunk's GGUF experts of Q8_0, Q4_K, Q5_K or Q6_K through hcm_body (hcm_dense_k's
  * products: the weights' loads apart from their decoding) instead of hcg_tile's: a tile's up to 64
@@ -6251,11 +6262,17 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
     if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act < 0 || p->act > 1 ||
         p->esc_off < 0) return 0;
     const int LS = p->lay_S > 0 ? p->lay_S : p->S;   /* the rows hid's layout is for: a part 1's, its rows' sums' (CcMoe.lay_S) */
-    /* SiTU-GLU and the scales outside the matrices (CcMoe.act 1, esc_off), NVFP4: a decode step's GEMV kernels only */
-    if ((p->act || p->esc_off || p->fmt == 140 || p->fmt_d == 140) && LS > CC_MOE_FRAME_ROWS) return 0;
+    /* SiTU-GLU, the scales outside the matrices (CcMoe.act 1, esc_off) and NVFP4 (140): a decode
+     * step's GEMV kernels, or a prompt chunk's block tiles of a GGUF's types (fmt 100+, the tiles'
+     * epilogue takes both); the int formats' prompt GEMMs have neither */
+    if ((p->act || p->esc_off || p->fmt == 140 || p->fmt_d == 140) && LS > CC_MOE_FRAME_ROWS && p->fmt < 100) return 0;
     if (p->lay_S < 0 || p->lay_s0 < 0 || p->lay_s0 > LS - p->S || ((p->parts & 1) && (LS != p->S || p->lay_s0))) return 0;
     if (p->fmt >= 100) {   /* a GGUF's experts: a decode step's rows on the GEMV kernels, a prompt chunk's sorted through the f16 tiles */
-        if (!moe_bd_ok(p) || p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;
+        static const int mdbg = getenv("COLI_MOE_DEBUG") != nullptr;   /* why a step's experts were refused */
+        if (!moe_bd_ok(p) || p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) {
+            if (mdbg) std::fprintf(stderr, "[CUDA] moe: refused, fmt %d/%d D %d I %d\n", p->fmt, p->fmt_d, p->D, p->I);
+            return 0;
+        }
         DeviceContext *bc = find_ctx(device);
         if (!select_ctx(bc)) return 0;
         cudaStream_t bst = (cudaStream_t)stream;
@@ -6265,6 +6282,9 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         int brows = tiles && btab && LS > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(bc) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
                     (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
         MoeSort bm = moe_sort_of(hid, p);
+        if (mdbg)
+            std::fprintf(stderr, "[CUDA] moe: LS %d brows %d tiles %d E %d hcg %d xrow %d hcm %d fmt %d/%d\n", LS, brows, tiles,
+                         p->E, hcg_ok(bc), p->x_row, hcm_moe_able(bc, p, btab), p->fmt, p->fmt_d);
         if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(bc, tab, x, ids, hid, bm, p, btab, bst) : moe_bd_launch(bc, tab, x, ids, hid, p, bst))))
             return 0;
         if (p->parts & 2) {
