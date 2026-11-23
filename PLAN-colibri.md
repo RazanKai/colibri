@@ -743,9 +743,11 @@ like-for-like target. The transferable facts are structural:
    per-layer arithmetic is a derived ceiling, not a result: 1,024 rows × 8 experts ×
    (gate+up+down at D=2304, I≈768) is ≈87 GFLOP a layer-step, and the measured host time
    (127–159 s over 63 chunks × 36 layer-steps ≈ 56–70 ms) implies ≈1.2–1.6 TFLOP/s on the CPU.
-   At the attention kernel's measured ~5 TFLOP/s a GPU GEMM would be ≈17 ms, and the measured
-   cold stream (18.8 GiB per 64K prefill ≈ 0.3 GiB a chunk at 5.2 GB/s ≈ 1 ms a layer-step) is
-   not the limiter. The microbench that decides it is one layer at 1,024 rows × 128 experts,
+   The attention kernel's ~5 TFLOP/s is an upper bound, not a forecast: 128 experts with ~64
+   rows each is tall and thin, so 1–3 TFLOP/s is the realistic range, i.e. **29–87 ms** — which
+   can be a wash against 56–70 ms. The measured cold stream (18.8 GiB per 64K prefill ≈ 0.3 GiB
+   a chunk at 5.2 GB/s ≈ 1 ms a layer-step) is small only at the current 75% residency; at
+   250K's ~56% the miss count rises. That is why the microbench, not this arithmetic, decides. The microbench that decides it is one layer at 1,024 rows × 128 experts,
    with the dequant and the upload of the missing 25% included; accept the spike if
    compute+upload lands under ~35 ms a layer-step (2× the host), not if it only matches 56–70 ms.
    Every prompt-step buffer also comes out of the tier budget, which moved prefill by ~190 s per
@@ -761,7 +763,9 @@ like-for-like target. The transferable facts are structural:
    | 2.0 GB | 699 | 184 | 8.6 |
 
    Prompt speed tracks resident experts, so the Strata-vs-colibri gap is substantially a
-   capacity/streaming difference, not only kernels. That strengthens the residency side of the
+   capacity/streaming difference, not only kernels. The 2,245 → 1,435 step is steeper than
+   linear (36% fewer experts, 55% less throughput), a streaming cliff rather than smooth
+   degradation, echoing the chunk-size cliffs. That strengthens the residency side of the
    spike but does not separate it from the kernel; the one-layer microbench above does.
 4. **Tensor cores become the critical path after 1.** At 250K the attention kernel is 673 s of
    the 836 s device side; once the 658–775 s host step is gone it dominates. The prompt kernel is
@@ -790,6 +794,63 @@ the 56–70 ms host layer-step) → the 64K prompt-expert spike only if that cle
 wavefront prototype if it cannot be made safe → the tensor-core kernel. All three gate on
 `bench/gate.sh` and the 250K needle, and every cell records the buffer bytes, the budget line and
 launch free VRAM.
+
+## 15.10 The one-layer prompt-MoE microbench: design and acceptance
+
+The microbench decides GPU prompt-MoE versus the wavefront, so its numbers have to survive the
+same scrutiny as the engine cells. Design, before any code:
+
+**Question.** What does one real prompt layer-step cost on the GPU (grouped expert GEMM +
+dequant + cold-expert upload), compared with the measured host layer-step (127–159 s over
+63 chunks × 36 steps ≈ **56–70 ms**), at the two residencies the engine actually runs?
+
+**Harness.** A new `c/tests/bench_cuda_moe.cu` against `cuda_chain.cu` (no engine): a synthetic
+128-expert table in the real formats (gate/up and down as the checkpoint's, q4/IQ3-style blocks),
+`S=1024`, `top-8`, `D=2304`, `I≈768`, real ids/weights, and the existing `cc_route`/`cc_moe`
+ops and upload path. The tier's table allocation and the 64K q4 KV mirror (~1 GiB) stay resident
+so VRAM pressure is real; log free VRAM, every buffer's bytes, and the equivalent budget line.
+
+**Routing is replayed, not uniform.** A uniform 64 rows an expert hides the tail. Rows are drawn
+per layer from that layer's `.coli_usage` histogram (the loop layers' top-40 carry 72–87% of
+activations); if `ROUTE_TRACE` can capture one 64K prefill, replay that instead. Report the
+per-expert row histogram, the top-40 share, and the padding/tail waste.
+
+**Cells** (one process at a time):
+- residency **75%** (2,296/3,072, the 64K tier) and **56%** (1,718/3,072, the 250K tier): the
+  measured cold set is uploaded through the real path, not a synthetic memcpy;
+- upload **overlapped on/off**, and a **PCIe-contention** case (a ~1 GiB KV-mirror upload running
+  on another stream at the same time);
+- one layer-step, then the **real layer sequence**: 24 layer-steps + the 12 loop layers twice
+  more = 36 steps a token, each with its own routing histogram, so the projection includes the
+  three passes;
+- report GEMM+dequant **ms and measured TFLOP/s** per step, upload ms/GiB, hidden ms with
+  overlap, total ms a layer-step, and the row histogram.
+
+**Acceptance** (written before running):
+- **< 35 ms** a layer-step: GPU prompt-MoE is the choice; the spike is worth it.
+- **35–56 ms**: still better than the host (56–70 ms), but the margin is small enough that the
+  wavefront can stack with it; decide on the projected seconds, not the per-step ratio.
+- **> 56 ms**: no gain; the wavefront is the lever.
+- Project to prefill in seconds, not ratios:
+  `prefill_new ≈ prefill − (host_expert − gpu_expert × steps)`, with attention unchanged.
+  At 64K that is 248 − (127 − ms×2,268/1000); at 250K, 1,678 − (658 − ms×8,784/1000). If the
+  expert phase drops below the attention kernel at 250K, the projection is capped by attention
+  and the tensor-core kernel becomes the next item.
+
+**Before the harness, one look at Strata's cold path.** At 699 experts (23%) it still prompts at
+184 tok/s; that is better than a simple residency ratio predicts (though still below colibri's
+~258 at 75%). The 2 GB start's log shows the mechanism: the same **119-slot pinned DMA ring
+(509 MiB), 64 MB prefetch, `direct=1`, and `promo=59`/`screen=1`** — at low VRAM it promotes cold
+experts into VRAM, like our tier's promotion. So its cold path is a pinned-ring + prefetch +
+promotion design, not a different compute path; our transfer design can be improved along the
+same lines, and that may be cheaper than a prompt `cc_moe`. Confirm the per-request transfer
+timeline before assigning the cause.
+
+**If it passes.** The spike touches `ink2cc_dmoe` and the tier — the typed-mirror bug's
+neighbourhood. `bench/gate.sh` plus the multi-depth needle run on every change, and one extra
+negative test: a 64K prompt through the new path must return the same needle facts as the same
+prompt with `COLI_CUDA_CHAIN_MOE=0` (retrieval, not token-exact; the tier's split changes the
+numerics).
 
 ## Appendix — benchmark commands
 
