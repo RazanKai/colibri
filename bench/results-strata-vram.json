@@ -1,0 +1,86 @@
+[
+ {
+  "kind": "needle3",
+  "target_k": 8,
+  "wall_s": 10.4,
+  "prompt_n": 8795,
+  "prompt_per_second": 912.5,
+  "predicted_n": 28,
+  "predicted_per_second": 43.9,
+  "draft_n": 32,
+  "draft_n_accepted": 22,
+  "facts": {
+   "7X4Q-ALPHA-93": true,
+   "PUMP-41-BRAVO-77": true,
+   "K9-ORBIT-27": true
+  },
+  "found": 3,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27",
+  "vram_experts_gb": 8.6,
+  "experts_resident": 2613,
+  "ctx": 32768
+ },
+ {
+  "kind": "needle3",
+  "target_k": 8,
+  "wall_s": 13.9,
+  "prompt_n": 8795,
+  "prompt_per_second": 675.4,
+  "predicted_n": 28,
+  "predicted_per_second": 36.7,
+  "draft_n": 31,
+  "draft_n_accepted": 23,
+  "facts": {
+   "7X4Q-ALPHA-93": true,
+   "PUMP-41-BRAVO-77": true,
+   "K9-ORBIT-27": true
+  },
+  "found": 3,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27",
+  "vram_experts_gb": 6,
+  "experts_resident": 2245,
+  "ctx": 32768
+ },
+ {
+  "kind": "needle3",
+  "target_k": 8,
+  "wall_s": 30.9,
+  "prompt_n": 8795,
+  "prompt_per_second": 305.7,
+  "predicted_n": 28,
+  "predicted_per_second": 14.2,
+  "draft_n": 34,
+  "draft_n_accepted": 22,
+  "facts": {
+   "7X4Q-ALPHA-93": true,
+   "PUMP-41-BRAVO-77": true,
+   "K9-ORBIT-27": true
+  },
+  "found": 3,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27",
+  "vram_experts_gb": 4,
+  "experts_resident": 1435,
+  "ctx": 32768
+ },
+ {
+  "kind": "needle3",
+  "target_k": 8,
+  "wall_s": 51.2,
+  "prompt_n": 8795,
+  "prompt_per_second": 183.8,
+  "predicted_n": 28,
+  "predicted_per_second": 8.6,
+  "draft_n": 31,
+  "draft_n_accepted": 23,
+  "facts": {
+   "7X4Q-ALPHA-93": true,
+   "PUMP-41-BRAVO-77": true,
+   "K9-ORBIT-27": true
+  },
+  "found": 3,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27",
+  "vram_experts_gb": 2,
+  "experts_resident": 699,
+  "ctx": 32768
+ }
+]

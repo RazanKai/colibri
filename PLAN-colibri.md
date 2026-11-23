@@ -727,33 +727,69 @@ like-for-like target. The transferable facts are structural:
    of 248.0 (51%) and the chain reports 159.1 s of routed experts on the host;
    `ink2cc_dmoe` declines every chunk over `CC_MOE_FRAME_ROWS` = 8, so all prompt experts run in
    `moe_ex` on the 6-core CPU while the GPU idles. Strata runs the experts on the GPU (2,609
-   resident, 463 streamed from SSD). This is the largest single lever and it subsumes the
-   wavefront: the wavefront hides the host step (300–450 s realistic), a GPU prompt-expert path
-   removes it. The spike is to let `ink2cc_dmoe` take a bounded prompt chunk (e.g. 256 rows),
-   size `dm_ids`/`dm_w`/`dm_hid`/`dm_y`/`kvl` for it, and use the tier's per-expert streaming for
-   cold experts — not whole-layer pinning, which §15.4 shows starves the other half at 250K.
-2. **If it stays on the host, overlap and prefetch it.** Strata's 119-slot pinned DMA ring,
-   64 MB prefetch and `direct=1` are why its SSD tail does not stall the prompt. Colibri
-   streams 18.8 GiB per 64K prefill (~5.2 GB/s) and hides only 11–17% of the host step; the
-   prefetch is issued inside the current layer's frame, not for the next layer's host step.
-   A pinned ring plus next-step prefetch is the wavefront prototype (PLAN 15.5, 300–450 s).
-3. **Tensor cores become the critical path after 1 or 2.** At 250K the attention kernel is
-   673 s of the 836 s device side; once the 658–775 s host step is gone it dominates. The prompt
-   kernel is fp32 CUDA cores at ~5 TFLOP/s; Strata's `sm120_tc=1` is the direction. Do it only
-   with a vectorized q4 unpack (PLAN §14), or dequant becomes the limiter.
-4. **Decouple the attention chunk from the expert step, and cut `other`.** Strata's prompt is
+   resident, 463 streamed from SSD). This is the largest *candidate* lever and it may subsume the
+   wavefront (the wavefront hides the host step, a GPU prompt path removes it), but the size of
+   the prize is an **estimate**, not a measurement: Strata's 2.6–2.7× also contains a different
+   quant (SQ-10 vs IQ3_XXS) and a larger resident set (85% vs 75%), and its internals are inferred
+   from its allocation log. The spike must measure the colibri path, not transfer Strata's ratio.
+   Do **not** shrink the step to 256 rows: at 256 rows × top-8 a step still touches nearly all
+   128 experts, so it would need four times as many steps and re-upload cold experts each time —
+   the chunk-2048/4096 mechanism in reverse. The work is a **grouped GEMM at 1,024 rows** over the
+   existing int8 block path (`cuda_bd.cuh`) with dequant fused and the upload overlapped.
+2. **The kernel and the upload are the unknowns.** The in-frame path today is decode-shaped:
+   `CC_MOE_FRAME_ROWS` = 8, GEMV-style expert kernels, and buffers sized for 8 rows. A prompt
+   step needs a grouped GEMM over IQ3-style blocks; if dequant dominates, it hits the same limit
+   as the fp32 attention kernel and a 12 GB card will not reach Strata-like throughput. The
+   per-layer arithmetic is a derived ceiling, not a result: 1,024 rows × 8 experts ×
+   (gate+up+down at D=2304, I≈768) is ≈87 GFLOP a layer-step, and the measured host time
+   (127–159 s over 63 chunks × 36 layer-steps ≈ 56–70 ms) implies ≈1.2–1.6 TFLOP/s on the CPU.
+   At the attention kernel's measured ~5 TFLOP/s a GPU GEMM would be ≈17 ms, and the measured
+   cold stream (18.8 GiB per 64K prefill ≈ 0.3 GiB a chunk at 5.2 GB/s ≈ 1 ms a layer-step) is
+   not the limiter. The microbench that decides it is one layer at 1,024 rows × 128 experts,
+   with the dequant and the upload of the missing 25% included; accept the spike if
+   compute+upload lands under ~35 ms a layer-step (2× the host), not if it only matches 56–70 ms.
+   Every prompt-step buffer also comes out of the tier budget, which moved prefill by ~190 s per
+   0.3 GiB at 250K (§15.1): log the buffer bytes and the budget line for every cell.
+3. **Strata's own sweep says capacity/streaming is a first-order variable.** At 32K, 8K prompt,
+   varying `--vram-experts-gb` (the rest fixed):
+
+   | VRAM for experts | experts resident | prompt tok/s | decode tok/s |
+   |---:|---:|---:|---:|
+   | 8.6 GB | 2,613 | 912 | 43.9 |
+   | 6.0 GB | 2,245 | 675 | 36.7 |
+   | 4.0 GB | 1,435 | 306 | 14.2 |
+   | 2.0 GB | 699 | 184 | 8.6 |
+
+   Prompt speed tracks resident experts, so the Strata-vs-colibri gap is substantially a
+   capacity/streaming difference, not only kernels. That strengthens the residency side of the
+   spike but does not separate it from the kernel; the one-layer microbench above does.
+4. **Tensor cores become the critical path after 1.** At 250K the attention kernel is 673 s of
+   the 836 s device side; once the 658–775 s host step is gone it dominates. The prompt kernel is
+   fp32 CUDA cores at ~5 TFLOP/s; Strata's `sm120_tc=1` is the direction. Do it only with a
+   vectorized q4 unpack (PLAN §14), or dequant becomes the limiter. This ordering is a
+   consequence of the expert fix, not a separate claim.
+5. **The prefetch-ordering point is an inference.** Strata's 119-slot pinned DMA ring, 64 MB
+   prefetch and `direct=1` are why its SSD tail does not stall the prompt. Colibri streams
+   18.8 GiB per 64K prefill (~5.2 GB/s) and hides only 11–17% of the host step. The code issues
+   `cut_stream_prefetch(i, n)` inside layer i's frame, so it prefetches for the current layer,
+   not the next layer's host step — but that is a reading of the code, not a measured transfer
+   timeline. Confirm it before calling it the cause; the wavefront prototype is where it gets
+   tested (PLAN 15.5, 300–450 s).
+6. **Decouple the attention chunk from the expert step, and cut `other`.** Strata's prompt is
    context-flat with large chunks; colibri pays 47.5 s (64K) / 180 s (250K) of `other` and a
    per-layer submit/finish. `COLI_VK_TIER_STEP` already caps the streamed expert step — the
    mechanism that killed chunk 2048 at 250K — so retry a big attention chunk with a small tier
    step, and fuse the per-layer norms/dconv/gate.
-5. **Do not copy the KV trade-off.** Strata spends the card on experts and offloads KV to host:
+7. **Do not copy the KV trade-off.** Strata spends the card on experts and offloads KV to host:
    a great prompt and 3.4–3.9 tok/s decode at 30–64K. Colibri's q4 device mirror and 75%
    residency give 17.8–18.1 tok/s at 64K. Keep the mirror; any GPU prompt path must leave it
    intact.
 
-Order to try: the 64K prompt-expert spike (bounded rows, streaming, gate + needle) first; if it
-cannot be made safe, the 64K wavefront prototype; then the tensor-core kernel. All three gate on
-`bench/gate.sh` and the 250K needle, and every cell records the budget line and launch free VRAM.
+Order to try: the one-layer grouped-GEMM microbench (1,024 rows, dequant + upload, compare with
+the 56–70 ms host layer-step) → the 64K prompt-expert spike only if that clears ~35 ms → the 64K
+wavefront prototype if it cannot be made safe → the tensor-core kernel. All three gate on
+`bench/gate.sh` and the 250K needle, and every cell records the buffer bytes, the budget line and
+launch free VRAM.
 
 ## Appendix — benchmark commands
 
