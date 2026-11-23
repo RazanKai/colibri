@@ -1109,14 +1109,30 @@ max 2.92 (K) / 1.611 (V), 0% of 493,780,992 values above f16's 65504.
 Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-new.out`.
 
 
-### 14.10 What is still open
+### 14.10 What is still open (updated after §15)
 
-- **The tensor-core prompt path (P1.2)** was not written. The gate it needed is measured: f16
-  is range-safe (§14.1) and the kernel/other split is now measured too (§14.8): at 250K the
-  kernel is ~566 s and the other device work ~266 s, so a 2.5× kernel wins ~340 s and no more.
-  A naive `mma` port would leave the q4 dequant (≈1280 instructions a position per KV head
-  against 768 FMAs) as the limiter; it only pays with a vectorized unpack in the same change.
-  It must still pass the CPU-reference and oracle gates.
-- **P4** waits on a `cc_moe` IQ2_S path.
-- **P5** waits on a vectorized block packer (~62 s at 250K).
-- **§6's needle** is still the gate on any retrieval claim at 250K.
+- **Prompt-MoE decision (the next gate).** Build `c/tests/bench_cuda_moe.cu` per §15.10 and run it
+  at 75%/56% residency with real routing histograms, overlap and PCIe contention. Do not touch
+  `ink2cc_dmoe` before it clears (<35 ms/layer-step pass; 35–56 ms still better than the host but
+  the wavefront can stack; >56 ms no gain).
+- **If it clears:** the 1,024-row grouped-GEMM prompt path in `ink2cc_dmoe` (sized buffers,
+  tier streaming, overlapped upload), gated by `gate.sh` plus the multi-depth needle, and the
+  negative test against `COLI_CUDA_CHAIN_MOE=0`.
+- **If it does not:** the 64K chunk wavefront (pinned ring, next-step prefetch, per-(chunk,layer)
+  KV-upload ordering; 300–450 s at 250K), then the tensor-core kernel.
+- **The tensor-core prompt path (P1.2)** is still not written. Its gate is measured: at 250K the
+  kernel is ~566–673 s and the other device work ~200–266 s, so a 2.5× kernel wins ~340–400 s and
+  no more. A naive `mma` port leaves q4 dequant (~1,280 instructions a position per KV head
+  against 768 FMAs) as the limiter; it needs the vectorized unpack in the same change, and the
+  CPU-reference/oracle gates.
+- **P5, the vectorized q4/q8 block packer**: ~62 s at 250K in `ink2cc_kv_down`; not done.
+- **250K decode parity**: llama.cpp was compared only at 8K/64K (§15.6). There is no 250K cell, so
+  "decode work dropped" is established only to 64K.
+- **Transfer timeline**: the prefetch-ordering statement is a code reading, not a measured
+  timeline; confirm it before calling it the cause of the 11–17% overlap.
+- **M3/M4**: 1M is YaRN-only and out of scope for the 262K acceptance — document the 24 GB
+  requirement; upstream the KV type and tiled kernel behind `INK2_KV`/`COLI_CUDA_RELATTN_QT` with
+  docs and tests.
+- **Closed**: the 250K needle (single code and the three-fact/three-depth prompt), the
+  whole-layer A/B (rejected as a 250K policy; the in-frame path is decode-only and +3–5% at
+  64K), the DSpark 8K/64K price, and the Strata cross-check with its VRAM sweep.
