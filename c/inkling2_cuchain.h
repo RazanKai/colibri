@@ -61,6 +61,8 @@ typedef struct {
     int dm_state;                              /* 0 untried, 1 on, -1 off */
     int dm_read; unsigned dm_epoch;
     uint8_t *dm_on; int *dm_fmt, *dm_gs, *dm_fmtd;
+    uint8_t *dm_onp;   /* COLI_CUDA_CHAIN_PROMPT_MOE: the layer's every expert present, the pooled ones read over the bus */
+    int dm_rows;       /* the row count dm_ids/dm_w/dm_hid/dm_y/kvl were sized for (a prompt chunk's, else 8) */
     uint32_t *dm_ent; CcExpert *dm_tabh; float *dm_esch;
     size_t dm_esc_off;
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_hid, *dm_y, *kvl;
@@ -118,6 +120,17 @@ static int ink2cc_mirror_host(void) {
  * convolution states, the K/V mirrors at the served context (ink_ctx_max), the loop's gates and
  * state, the routed experts' table and buffers and the scratch of a prompt chunk of 256 rows. The
  * tier's budget leaves them (ink_vk_dense_bytes). */
+/* COLI_CUDA_CHAIN_PROMPT_MOE (0 by default): a prompt chunk's rows (up to COLI_CUDA_CHAIN_ROWS) run a
+ * layer's routed experts in the frame too, sorted by expert through the block tiles - every expert
+ * of the layer must be present: the tier's residents on the card, the rest in its host pool
+ * (cudaHostGetDevicePointer's mapping), which the tiles read over the bus. Priced by PLAN
+ * 15.10/15.11's microbench before it was wired: 8.5-9.1 ms a 1,024-row layer-step against the
+ * host's measured 56-70. Needs COLI_VK_TIER_HOST=1 for the pool. */
+static int ink2cc_prompt_moe(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_PROMPT_MOE"); on = e && *e && *e != '0'; }
+    return on;
+}
 static size_t ink2cc_plan_bytes(const Model *m) {
     const Cfg *c = &m->c;
     size_t D = (size_t)c->hidden, E = (size_t)c->n_experts, CK = (size_t)c->conv_k, K = (size_t)c->topk, b = 0, row = 0;
@@ -146,8 +159,9 @@ static size_t ink2cc_plan_bytes(const Model *m) {
         if (r1 > row) row = r1;
     }
     if (c->loop_p > 1) row += ((size_t)(7 + ink2cc_maxb(c)) * D + (size_t)c->loop_r) * 4;   /* a row's loop scratch */
-    /* the routed experts in the frame: the table and its scales, the ids, the weights, the hidden rows, the sum, kvl */
-    const size_t R8 = CC_MOE_FRAME_ROWS;
+    /* the routed experts in the frame: the table and its scales, the ids, the weights, the hidden rows, the sum, kvl
+     * (a prompt chunk's, when COLI_CUDA_CHAIN_PROMPT_MOE asked for them: the default chunk's 1,024 rows) */
+    const size_t R8 = ink2cc_prompt_moe() ? 1024 : CC_MOE_FRAME_ROWS;
     b += (size_t)c->n_layers * E * (sizeof(CcExpert) + 8) + (size_t)c->n_state * R8 * K * 4 + R8 * K * 4 +
          cc_moe_hid_floats((int)R8, (int)K, (int)D, c->moe_inter, (int)E) * 4 + R8 * D * 4 + (size_t)c->n_state * 2 * R8 * kvm * 4;
     return b + row * 256 + (size_t)c->unpad_vocab * 4 + ((size_t)ink2cc_maxb(c) * D * 4) * 256;
@@ -647,13 +661,15 @@ static int ink2cc_dm_wanted(void) {
 }
 /* layer i's formats as cc_moe takes them, from expert 0's entry words (cu_xb_expert_entry); every
  * expert of the layer the same, on the device (not the host pool); 0 = the host's step */
-static int ink2cc_dm_layer(Ink2CuChain *ch, Model *m, int i, const uint32_t *ent) {
+static int ink2cc_dm_layer(Ink2CuChain *ch, Model *m, int i, const uint32_t *ent, int prompt) {
     Cfg *c = &m->c; const int E = c->n_experts;
     const uint32_t fg = ent[14], gs = ent[15], fd = ent[16], gd = ent[17];
     for (int e = 0; e < E; e++) {
         const uint32_t *w = ent + (size_t)e * INK2CC_ENT;
         CcExpert x; memcpy(&x, w, sizeof x);
-        if (w[18] != 1u || w[14] != fg || w[15] != gs || w[16] != fd || w[17] != gd || !x.g || x.host) return 0;
+        /* prompt: an entry in the tier's host pool is the device's too (cudaHostGetDevicePointer's,
+         * cu_xb.cu), which is what lets a chunk's rows take every expert of the layer */
+        if (w[18] != 1u || w[14] != fg || w[15] != gs || w[16] != fd || w[17] != gd || !x.g || (x.host && !prompt)) return 0;
     }
     int ok;
     if (fg >= 100) ok = fd >= 100 && (cc_moe_block_type((int)fg - 100) || fg == 140) && (cc_moe_block_type((int)fd - 100) || fd == 140);
@@ -673,14 +689,15 @@ static int ink2cc_dm_table(Ink2CuChain *ch, Model *m) {
     for (int i = 0; i < L; i++) {
         int nres = cut_dev_table(i, ch->dm_ent);
         if (nres < 0) { ch->dm_state = -1; return 0; }
-        ch->dm_on[i] = nres == E && ink2cc_dm_layer(ch, m, i, ch->dm_ent);
+        ch->dm_on[i] = nres == E && ink2cc_dm_layer(ch, m, i, ch->dm_ent, 0);
+        ch->dm_onp[i] = ink2cc_prompt_moe() && nres > 0 && ink2cc_dm_layer(ch, m, i, ch->dm_ent, 1);
         if (getenv("INK2CC_DM_DEBUG") && ch->dm_reads == 0) {
             const uint32_t *w = ch->dm_ent;
             CcExpert x; memcpy(&x, w, sizeof x);
             fprintf(stderr, "[dmdbg] layer %2d nres %3d on %d | fg %u gs %u fd %u gd %u w18 %u g %d host %d\n",
                     i, nres, ch->dm_on[i], w[14], w[15], w[16], w[17], w[18], x.g ? 1 : 0, x.host);
         }
-        any |= ch->dm_on[i];
+        any |= ch->dm_on[i] | ch->dm_onp[i];
         for (int e = 0; e < E; e++) {
             memcpy(&ch->dm_tabh[(size_t)i * E + e], ch->dm_ent + (size_t)e * INK2CC_ENT, sizeof(CcExpert));
             ch->dm_esch[((size_t)i * E + e) * 2] = m->L[i].xgsc ? m->L[i].xgsc[e] : 1.f;
@@ -694,9 +711,12 @@ static int ink2cc_dm_table(Ink2CuChain *ch, Model *m) {
     }
     ch->dm_epoch = cut_epoch(); ch->dm_read = 1; ch->dm_reads++;
     if (ch->dm_reads == 1) {
-        int nl = 0; for (int i = 0; i < L; i++) nl += ch->dm_on[i];
-        fprintf(stderr, "[CUDA] inkling2 chain: the routed experts of %d of %d layers in the frame (the tier holds them all on the device)\n",
+        int nl = 0, np = 0; for (int i = 0; i < L; i++) { nl += ch->dm_on[i]; np += ch->dm_onp[i]; }
+        fprintf(stderr, "[CUDA] inkling2 chain: the routed experts of %d of %d layers in the frame (the tier holds them all on the device)",
                 nl, L);
+        if (ink2cc_prompt_moe())
+            fprintf(stderr, "; a prompt chunk's of %d more (every expert present, the tier's host pool read over the bus)", np);
+        fprintf(stderr, "\n");
     }
     return any;
 }
@@ -705,7 +725,9 @@ static int ink2cc_dm_table(Ink2CuChain *ch, Model *m) {
  * backend without CC_INK2_MOE */
 static int ink2cc_dmoe(Ink2CuChain *ch, Model *m, int rows) {
     Cfg *c = &m->c; const int L = c->n_layers, E = c->n_experts, K = c->topk;
-    if (ch->dm_state < 0 || rows > CC_MOE_FRAME_ROWS || (g_topp > 0.f && g_topp < 1.f) || rt_fp || c->n_shared > 0) {
+    const int rowmax = ink2cc_prompt_moe() ? 8192 : CC_MOE_FRAME_ROWS;
+    if (ch->dm_state < 0 || rows > rowmax || (ch->dm_state == 1 && rows > ch->dm_rows) ||
+        (g_topp > 0.f && g_topp < 1.f) || rt_fp || c->n_shared > 0) {
         static int said;   /* P4: the frame's MoE is gated by a shared expert, which cc_moe has no path for */
         if (!said && c->n_shared > 0 && rows <= CC_MOE_FRAME_ROWS && !rt_fp && g_topp >= 1.f) {
             said = 1;
@@ -718,13 +740,14 @@ static int ink2cc_dmoe(Ink2CuChain *ch, Model *m, int rows) {
         ch->dm_state = -1;
         if (!ink2cc_dm_wanted() || !(cc_ink2_caps() & CC_INK2_MOE) || !cc_moe_ready() || !cut_ready() || cut_devices() > 1 ||
             E < 1 || E > CC_ROUTE_EMAX || K < 1 || K > CC_ROUTE_KMAX) return 0;
-        const size_t nt = (size_t)L * E, R8 = CC_MOE_FRAME_ROWS;
+        const size_t nt = (size_t)L * E, R8 = rows > CC_MOE_FRAME_ROWS ? (size_t)rows : CC_MOE_FRAME_ROWS;
+        ch->dm_rows = (int)R8;
         ch->dm_esc_off = (nt * sizeof(CcExpert) + 255) & ~(size_t)255;
-        ch->dm_on = calloc((size_t)L, 1); ch->dm_fmt = calloc((size_t)L, sizeof(int));
+        ch->dm_on = calloc((size_t)L, 1); ch->dm_onp = calloc((size_t)L, 1); ch->dm_fmt = calloc((size_t)L, sizeof(int));
         ch->dm_gs = calloc((size_t)L, sizeof(int)); ch->dm_fmtd = calloc((size_t)L, sizeof(int));
         ch->dm_ent = malloc((size_t)E * INK2CC_ENT * sizeof(uint32_t));
         ch->dm_tabh = calloc(nt, sizeof(CcExpert)); ch->dm_esch = malloc(nt * 2 * sizeof(float));
-        if (!ch->dm_on || !ch->dm_fmt || !ch->dm_gs || !ch->dm_fmtd || !ch->dm_ent || !ch->dm_tabh || !ch->dm_esch) return 0;
+        if (!ch->dm_on || !ch->dm_onp || !ch->dm_fmt || !ch->dm_gs || !ch->dm_fmtd || !ch->dm_ent || !ch->dm_tabh || !ch->dm_esch) return 0;
         if (!(ch->dm_tab = cc_buf(ch->dm_esc_off + nt * 2 * sizeof(float), CC_DEV)) ||
             !(ch->dm_ids = cc_buf((size_t)ch->NS * R8 * K * sizeof(int), CC_DOWN)) ||
             !(ch->dm_w = cc_buf((size_t)ch->NS * R8 * K * sizeof(float), CC_DEV)) ||
@@ -734,6 +757,13 @@ static int ink2cc_dmoe(Ink2CuChain *ch, Model *m, int rows) {
             fprintf(stderr, "[CUDA] inkling2 chain: no device memory for the routed experts' buffers; their host's step\n");
             return 0;
         }
+        if (R8 > CC_MOE_FRAME_ROWS)
+            fprintf(stderr, "[CUDA] inkling2 chain: a prompt chunk's %zu rows: ids %.1f KiB, w %.1f KiB, hid %.1f MiB, "
+                            "y %.1f MiB, kvl %.1f MiB (the tier's budget pays the hid and y)\n", R8,
+                    2.0 * ch->NS * R8 * K * sizeof(int) / 1024.0, 2.0 * ch->NS * R8 * K * sizeof(float) / 1024.0,
+                    cc_moe_hid_floats((int)R8, K, c->hidden, c->moe_inter, E) * sizeof(float) / 1048576.0,
+                    R8 * (double)c->hidden * sizeof(float) / 1048576.0,
+                    2.0 * ch->NS * R8 * ch->kvo_max * sizeof(float) / 1048576.0);
         ch->dm_state = 1;
     }
     return ink2cc_dm_table(ch, m);
@@ -742,9 +772,9 @@ static int ink2cc_dmoe(Ink2CuChain *ch, Model *m, int rows) {
  * host's cache and its books, as moe_ex and ink_vk_moe keep them */
 static void ink2cc_dmoe_done(Ink2CuChain *ch, Model *m, int i, int v, int n, int pb) {
     const int K = m->c.topk;
-    const size_t reg = (size_t)2 * CC_MOE_FRAME_ROWS * ch->kvo_max;
+    const size_t reg = (size_t)2 * ch->dm_rows * ch->kvo_max;
     ink2cc_kv_down(ch, m, v, n, pb, (const float *)cc_ptr(ch->kvl) + (size_t)v * reg, reg / 2);
-    const int *ids = (const int *)cc_ptr(ch->dm_ids) + (size_t)v * CC_MOE_FRAME_ROWS * K;
+    const int *ids = (const int *)cc_ptr(ch->dm_ids) + (size_t)v * ch->dm_rows * K;
     m->ereq += (uint64_t)n * K; m->euse += (uint64_t)n * K;
     for (int j = 0; j < n * K; j++) {
         if (ids[j] < 0) continue;
@@ -813,7 +843,7 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             Layer *l = &m->L[i]; Ink2Layer *x2 = l->x2;
             int local = c->local[i];
             if (pending) ok = ink2cc_join(ch, m, pi, pv, n, prev_dev ? ch->dm_y : ch->routed);
-            const int dl = dmoe && ch->dm_on[i];   /* its experts here, no wait */
+            const int dl = dmoe && (n > CC_MOE_FRAME_ROWS ? ch->dm_onp[i] : ch->dm_on[i]);   /* its experts here, no wait */
             const int msg = lp && pass > 0;   /* a later pass: this layer's four messages */
             if (ok && lp && i == ls) {
                 if (pass == 0) {   /* the loop's input stream, which every pass starts from */
@@ -854,7 +884,7 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             if (sep) ok = ok && ink2cc_norm(ik, ch->prm, local ? ch->o_n1[i] : ch->o_n2[i], ch->nk, n, D, c->eps) &&
                               ink2cc_norm(iv, ch->prm, local ? ch->o_n1[i] : ch->o_n3[i], ch->nv, n, D, c->eps);
             {   /* the step's K/V rows: kvd for the host's step after this frame, kvl's region when the frame goes on */
-                const size_t reg = (size_t)2 * CC_MOE_FRAME_ROWS * ch->kvo_max;
+                const size_t reg = (size_t)2 * ch->dm_rows * ch->kvo_max;
                 ok = ok && (dl ? ink2cc_attention(ch, m, i, v, sep, n, pb, ch->kvl, (size_t)v * reg, reg / 2)
                                : ink2cc_attention(ch, m, i, v, sep, n, pb, ch->kvd, 0, (size_t)R * ch->kvo_max)) &&
                      ink2cc_sconv(ch, ch->a, 0, n, D, 2, i, v, c);
@@ -878,7 +908,7 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
                  ink2cc_norm(ch->hq, ch->prm, ch->o_post[i], ch->nq, n, D, c->eps) &&
                  cc_matmul(ch->t_router[i], ch->nq, 0, ch->lg, 0, n);
             if (dl) {   /* Inkling-2's routing and SiTU-GLU experts here (moe_ex's), and on */
-                const int ko = v * CC_MOE_FRAME_ROWS * K;
+                const int ko = v * ch->dm_rows * K;
                 CcRoute rp = {n, E, K, 1, 0, E, (int)ch->o_rb[i], 1, ko, K, ko, K, 1, 1, 1, 1.f, c->route_scale * l->rgs, 0.f};
                 CcMoe mp = {0};
                 mp.S = n; mp.K = K; mp.D = D; mp.I = c->moe_inter; mp.fmt = ch->dm_fmt[i]; mp.gs = ch->dm_gs[i]; mp.act = 1; mp.parts = 3;
@@ -907,7 +937,7 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             ch->host_ms += (now_s() - t1) * 1e3;
             /* the host's step ran the tier: where its residents moved, the layers after this one take
              * the host's step too for the rest of this frame (the table is read again before the next) */
-            if (dmoe && ch->dm_epoch != cut_epoch()) dmoe = 0;
+            if (dmoe && ch->dm_epoch != cut_epoch()) dmoe = 0;   /* the next chunk reads the table again */
             ok = cc_begin();
             pending = 1; pi = i; pv = v; prev_dev = 0;
         }

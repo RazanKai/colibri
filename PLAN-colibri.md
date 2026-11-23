@@ -974,6 +974,53 @@ card does not have beside twelve layers' experts on the CPU. Getting a reference
 more experts on the CPU (`--n-cpu-moe` up), which changes the setting and so stops being
 like-for-like. **250K decode parity stays open, with its reason measured.**
 
+## 15.14 The prompt-MoE path in the engine, prototyped and measured at 64K
+
+§15.11's decision (GPU prompt-MoE) is now in the engine: `COLI_CUDA_CHAIN_PROMPT_MOE=1` lets
+`ink2cc_dmoe` take a prompt chunk's rows (up to `COLI_CUDA_CHAIN_ROWS`, 1,024 by default) and a
+layer's every expert run in the frame, sorted by expert through the block tiles
+(`cc_route` + `cc_moe`, `SiTU-GLU`, the per-expert scales, NVFP4 down — the tiles' epilogue in
+`f900479`). A layer qualifies only when **every expert is present**: the tier's residents on the
+card, the rest in its **host pool** (`COLI_VK_TIER_HOST=1`, 3.0 GiB of pinned RAM the tiles read
+over the bus). Decode keeps the residents-only decision, so its path is untouched. Default 0: with
+the flag off nothing changes (the gate ran green on that path before the change).
+
+The pair at 64K, same prompt (`needle_depth.build` at 64,000 tokens, the three facts at
+10/50/90%), same context, same tree, same pool, only the switch differing
+(`bench/results-prompt-moe.json`):
+
+| | A: host's step (`COLI_CUDA_CHAIN_MOE=0`) | B: the frame (`=1`) |
+|---|---:|---:|
+| prefill | 267.0 s | **162.0 s** (−39%) |
+| phases (s) | expert-mm 132.7 / attn 84.2 / other 52.5 | **1.8 / 53.2 / 109.6** |
+| decode (TUNE) | 12.94 tok/s | 12.27 tok/s (−5%) |
+| routed experts on the host | 165.2 s | **1.8 s** |
+| layer-steps' experts in the frame | 0 | **3,312** (69 chunks x 48) |
+| budget / pool | 7.49 GiB = 2,304 + 768 | 7.01 GiB = 2,150 + 922 |
+| RSS / device | 9.1 GB / 1,045 MiB | 10.6 GB / 1,164 MiB |
+| needle | 3 of 3 | **3 of 3**, the same generation |
+| buffers | — | ids 3.0 MiB, w 3.0 MiB, hid 108.1 MiB, y 9.0 MiB, kvl 384 MiB |
+
+The timing prompt (`bench/prompt-64k.txt`, the published baseline's own) with the path on:
+**156.4 s**, phases 0.5 / 55.2 / 101.5, decode 17.07 tok/s, 3,024 layer-steps in the frame.
+
+**Gates (all measured, this tree, the path on).** `bench/gate.sh` green: `cuda-inkc-check` all
+green and the needle 4/4 at 1K/2K/4K/8K through the new path; `needle_check` 1K/4K/8K/16K all found
+with the path and with `COLI_CUDA_CHAIN_MOE=0`; `needle_depth --tokens 64000` **3 of 3 both ways**
+with the same generation `7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27.` — the negative test the
+plan asked for (retrieval, not token-exact: the tier's split changes the numerics).
+
+**What it costs, and where it stops.** The pool is the cost: against the pool-off published
+baseline (248.0 s, 17.77–18.09 tok/s, another commit and prompt) a run with the pool pays decode
+(the tier copies pooled experts into its 64 slots: 38,557 copies, 118.4 GiB in the needle prompt's
+run), not the tiles. And the path's requirement — every expert present — fails at a
+262K-served context: `needle_depth` with its `CTX_MAX=262144` leaves the pool 1.50 GiB (410
+experts) and the tier 5.14 GiB (1,561), so **0 of 24 layers** qualify and the run is the host's
+step either way (323.3 s asked for the path against 318.8 s, needle 3/3 both). So the prototype is
+a 64K-class-path win measured end to end, and a 250K path needs either a bigger pool or the
+per-step staging copies §15.10 specified (whose price the microbench measured: 15.4 ms a step at
+75%, 21.1 at 56%, where the pool's per-step copies are not in that number).
+
 ## Appendix — benchmark commands
 
 ```bash
@@ -1241,17 +1288,19 @@ Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-n
   layer-step at 75% and 21.1 ms at 56%, against the 35 ms gate and the 56–70 ms host step; the
   projection is 64K prefill 156 s (was 248.0) and 250K 1,155 s (was 1,678.0). GPU prompt-MoE is
   the choice; the 64K chunk wavefront is not needed for this item and stays unbuilt.
-- **The 1,024-row prompt path in the engine (the next gate).** `ink2cc_dmoe` still refuses rows
-  over `CC_MOE_FRAME_ROWS`, so a prompt chunk's experts run on the host (127.0 s of expert-mm at
-  64K) while the measured device path is 15.4 ms a layer-step. What the spike needs, in the
-  microbench's order: buffers sized for the chunk (`dm_ids/dm_w/dm_hid/dm_y/kvl`), the cold set
-  staged (two banks, `cc_fetch`/`fetch_wait`/`fetch_done`, the table's cold entries pointing into
-  the bank), `COLI_CUDA_MOE_TILE128=0` at this shape, and the mirror's rows spread away from the
-  expert stream (§15.11 point 2). Gated by `gate.sh`, `needle_depth.py` and the negative test
-  against `COLI_CUDA_CHAIN_MOE=0`.
+- **The prompt path at 64K: done, measured, gated (§15.14).** `COLI_CUDA_CHAIN_PROMPT_MOE=1` with
+  `COLI_VK_TIER_HOST=1` runs a chunk's every expert in the frame: prefill 267.0 → **162.0 s**
+  (−39%) on the same prompt, the 3-fact needle 3/3 both ways, `gate.sh` green. Default off, so the
+  default path is as it was.
+- **The prompt path above 64K is open, and why is measured.** The path needs every expert of a
+  layer present (residents + host pool); at a 262K-served context the pool gets 1.50 GiB (410
+  experts) and 0 of 24 layers qualify (§15.14). The 250K lever is the per-step staging
+  (`cc_fetch`, two banks) that §15.11 priced at 15.4/21.1 ms a layer-step, not the pool; it also
+  removes the pool's decode cost (the tier's 118 GiB of slot copies).
 - **A hybrid instead of streaming** (device the residents, the host its non-resident pairs) is
   10 s better at 64K by the microbench's tiles-only cell, and cheaper in PCIe (no 369 GiB of
-  uploads at 56%); it needs a filtered host pair step (`moe_ex` takes every rank today).
+  uploads at 56%); it needs a filtered host pair step (`moe_ex` takes every rank today). Not
+  needed for the 64K win §15.14 measured; it is the cheaper 250K route.
 - **The tensor-core prompt path (P1.2)** is still not written, but its premise is now **measured**
   (§15.12, `bench/results-tensor-core.json`): at 250K and 1,024 rows the q4 kernel reaches 58.6
   GB/s where f32 reaches 246 GB/s, i.e. ~4/5 of its 729.6 ms is the unpack, with a 4.3× headroom
