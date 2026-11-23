@@ -852,6 +852,70 @@ negative test: a 64K prompt through the new path must return the same needle fac
 prompt with `COLI_CUDA_CHAIN_MOE=0` (retrieval, not token-exact; the tier's split changes the
 numerics).
 
+## 15.11 The prompt-MoE microbench, measured: GPU prompt-MoE is the choice
+
+Built as §15.10 specified (`c/tests/bench_cuda_moe.cu`, `make -C c cuda-moe-bench`; rows in
+`bench/results-moe-bench.json`; commit `f900479`). One process, no engine; the table synthetic in
+the snapshot's own per-layer formats and dimensions, the routing drawn from the snapshot's
+`.coli_usage`. What differs from the plan's sketch, and why it is more faithful than the sketch:
+
+- **I is 1,152, not 768** (`inkling2.expert_feed_forward_length` in the GGUF), so a layer-step is
+  130.5 GFLOP, not 87. The formats also vary by layer (the UD quant): gate/up IQ2_XXS (L0),
+  IQ2_XS (L4), IQ2_S, IQ3_XXS (L9–L11, L13–L17, L19–L23), and down NVFP4 (L0–L19) or IQ4_NL
+  (L20–L23). Both are parsed from the GGUF's tensor header and used as they are, so the down of
+  twenty layers is the format the plan expected (140) and the other four are not.
+- **The prompt tiles could not run these experts before this commit.** `hcg_tile`'s epilogue was
+  silu only, had no place for the per-expert scales `CcMoe.esc_off` carries (the GGUF's
+  `ffn_*_exps.scale`) and `coli_cuda_moe_async` refused `act 1`, `esc_off` and NVFP4 at more than
+  `CC_MOE_FRAME_ROWS` rows. All three are now in the block tiles' epilogue (`moe_glu3` is the same
+  expression the decode step's GEMV kernels use), behind `fmt >= 100`; the int8 path and the f32
+  path are untouched. `gate.sh` passes on the change.
+- **The cold set is ~29 experts a layer, not 32, and unevenly spread**: the tier's warm start is a
+  global ranking of the history, so the loop layers (three passes of counts) take nearly all their
+  experts and the early/late layers take fewer. That is why the residents carry 98.7% of the rows
+  at 2,296 experts (94.1% at 1,718) although only 75%/56% of the experts are on the card.
+
+| cell (RTX 5070, 10.4 GiB free, one process) | 75% (2,296, 7.18 GiB) | 56% (1,718, 5.37 GiB) |
+|---|---:|---:|
+| tiles alone, all 128 experts | **9.07 ms**, 14.4 TFLOP/s | **8.51 ms**, 15.3 TFLOP/s |
+| tiles alone, residents only | 8.15 ms | 6.76 ms |
+| cold upload alone | 7.16 ms (90.9 MiB, 12.4 GB/s) | 12.99 ms (166.7 MiB, 12.5 GB/s) |
+| sequence, serial | 16.04 ms | 21.45 ms |
+| sequence, prefetched | **15.42 ms** | **21.05 ms** |
+| sequence, + a 1 GiB mirror copy in each step | 89.78 ms | — |
+| projection, 64K prefill | **156 s** (was 248.0) | 169 s |
+| projection, 250K prefill | **1,155 s** (was 1,678.0) | 1,205 s |
+
+**Decision (the gate as written before running): GPU prompt-MoE.** 15.4 ms a layer-step is 2.5×
+under the 35 ms gate and 27% of the measured 56.0 ms host step (127.0 s / 2,268); the projection is
+−92 s of 64K prefill and −523 s at 250K, and the 250K figure is not capped by attention (its floor
+is `attn 836.4 + other 180.1 + fill 5.3 = 1,021.8 s`, below 1,155 s). All projected numbers are
+`derived`; every ms in the table is `measured`.
+
+Four things the table does not say on its own, and that the cells measured:
+
+1. **The prefetch does not hide the upload on this box.** The copy keeps its own 12.5 GB/s (it is
+   2.13 ms for layer 6's 28.7 MiB inside a prefetched step), but the tile frame's submit grows by
+   almost exactly the copy's duration (8.23 → 10.37 ms), and at 90.9 MiB a step the sequence only
+   moves 16.04 → 15.42 ms. A raw two-stream probe (a 91 MiB copy 7.01 ms, a spin kernel 2.64 ms,
+   both 7.06 ms) shows the device does overlap DMA with compute, so the limit is the tiles
+   themselves: 14–15 TFLOP/s of 100 is a latency-bound read of 128 experts' weights, and the DMA's
+   writes are enough to slow it. Recorded, not explained further.
+2. **A whole 1 GiB mirror upload inside one layer-step's window costs 74 ms** (89.8 ms a step). At
+   64K the engine's mirror is ~0.6 GiB over the whole prefill, so this is only the worst case of
+   scheduling it badly: the prompt path must spread the mirror's rows, never put them all in one
+   layer's window.
+3. **128-row tiles would be wrong here**: 8,192 rows over a heavy-tailed 128-expert history leave
+   61% padding at 64-row tiles and 137% at 128-row tiles, so `COLI_CUDA_MOE_TILE128` must stay off
+   for this shape (it is on only from `A >= 32*E`, which this is, so the prompt path must set
+   `COLI_CUDA_MOE_TILE128=0` or the tile choice needs a padding term).
+4. **The upload is the expensive half at 56%**: 166.7 MiB a step is 369 GiB over a 64K prefill
+   (30 s of PCIe) against the host path's measured 18.8 GiB, because the same non-resident experts
+   are streamed once per chunk. A hybrid that leaves the non-resident pairs on the host is bounded
+   by `max(device, host)` = 18.5 s at 75% and 15.3 s at 56% of expert work, better than streaming
+   them; it needs a filtered host pair step, so the streaming path (§15.10's "if it passes") is
+   what gets prototyped first.
+
 ## Appendix — benchmark commands
 
 ```bash
@@ -861,6 +925,10 @@ make -C c inkling CUDA=1 CUDA_HOME=/opt/cuda
 # tests
 cc -O2 -march=native -I c c/tests/test_ink_kv.c -lm -o /tmp/test_ink_kv && /tmp/test_ink_kv
 make -C c cuda-inkc-check CUDA=1 CUDA_HOME=/opt/cuda
+# the prompt expert step alone (PLAN 15.10/15.11): residency %  steps  overlap  contend
+make -C c cuda-moe-bench CUDA=1 CUDA_HOME=/opt/cuda
+./c/cuda_moe_bench 75 36 1 1     # 2,296 experts of 3,072, the 36-step sequence, prefetched, + a 1 GiB mirror copy
+./c/cuda_moe_bench 56 36 1 0     # 1,718 of 3,072, the 250K tier's
 
 # import
 ./c/coli import /path/Inkling-2-Mini-UD-IQ3_XXS.gguf \
@@ -1109,17 +1177,23 @@ max 2.92 (K) / 1.611 (V), 0% of 493,780,992 values above f16's 65504.
 Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-new.out`.
 
 
-### 14.10 What is still open (updated after §15)
+### 14.10 What is still open (updated after §15.11)
 
-- **Prompt-MoE decision (the next gate).** Build `c/tests/bench_cuda_moe.cu` per §15.10 and run it
-  at 75%/56% residency with real routing histograms, overlap and PCIe contention. Do not touch
-  `ink2cc_dmoe` before it clears (<35 ms/layer-step pass; 35–56 ms still better than the host but
-  the wavefront can stack; >56 ms no gain).
-- **If it clears:** the 1,024-row grouped-GEMM prompt path in `ink2cc_dmoe` (sized buffers,
-  tier streaming, overlapped upload), gated by `gate.sh` plus the multi-depth needle, and the
-  negative test against `COLI_CUDA_CHAIN_MOE=0`.
-- **If it does not:** the 64K chunk wavefront (pinned ring, next-step prefetch, per-(chunk,layer)
-  KV-upload ordering; 300–450 s at 250K), then the tensor-core kernel.
+- **Prompt-MoE decision: closed, it clears.** Built and run (§15.11, `f900479`): 15.4 ms a
+  layer-step at 75% and 21.1 ms at 56%, against the 35 ms gate and the 56–70 ms host step; the
+  projection is 64K prefill 156 s (was 248.0) and 250K 1,155 s (was 1,678.0). GPU prompt-MoE is
+  the choice; the 64K chunk wavefront is not needed for this item and stays unbuilt.
+- **The 1,024-row prompt path in the engine (the next gate).** `ink2cc_dmoe` still refuses rows
+  over `CC_MOE_FRAME_ROWS`, so a prompt chunk's experts run on the host (127.0 s of expert-mm at
+  64K) while the measured device path is 15.4 ms a layer-step. What the spike needs, in the
+  microbench's order: buffers sized for the chunk (`dm_ids/dm_w/dm_hid/dm_y/kvl`), the cold set
+  staged (two banks, `cc_fetch`/`fetch_wait`/`fetch_done`, the table's cold entries pointing into
+  the bank), `COLI_CUDA_MOE_TILE128=0` at this shape, and the mirror's rows spread away from the
+  expert stream (§15.11 point 2). Gated by `gate.sh`, `needle_depth.py` and the negative test
+  against `COLI_CUDA_CHAIN_MOE=0`.
+- **A hybrid instead of streaming** (device the residents, the host its non-resident pairs) is
+  10 s better at 64K by the microbench's tiles-only cell, and cheaper in PCIe (no 369 GiB of
+  uploads at 56%); it needs a filtered host pair step (`moe_ex` takes every rank today).
 - **The tensor-core prompt path (P1.2)** is still not written. Its gate is measured: at 250K the
   kernel is ~566–673 s and the other device work ~200–266 s, so a 2.5× kernel wins ~340–400 s and
   no more. A naive `mma` port leaves q4 dequant (~1,280 instructions a position per KV head
