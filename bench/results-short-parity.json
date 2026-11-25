@@ -1,0 +1,58 @@
+[
+ {
+  "cell": "engine-short-721",
+  "prompt_tokens": 721,
+  "prefill_s": 6.0,
+  "decode_tok_s": 27.68,
+  "tokens": 100,
+  "rss_gb": 7.1,
+  "phases_s": {
+   "fill": 2.2,
+   "expert_mm": 4.8,
+   "attn": 0.9,
+   "other": 1.7
+  },
+  "log": "/var/tmp/scratch/opencode/colibri-runs/engine-short600.log",
+  "commit": "075e92b3",
+  "provenance": "measured"
+ },
+ {
+  "cell": "reference-b12676-short-721",
+  "prompt_tokens": 721,
+  "prompt_tok_s": 130.2,
+  "prefill_s": 5.54,
+  "decode_tok_s": 21.21,
+  "log": "/var/tmp/scratch/opencode/colibri-runs/dspark-8K-nomd.log",
+  "provenance": "measured"
+ },
+ {
+  "cell": "engine-8k",
+  "prompt_tokens": 8027,
+  "prefill_s": 36.8,
+  "prefill_tok_s": 218,
+  "decode_tok_s": 24.25,
+  "tokens": 100,
+  "rss_gb": 8.0,
+  "log": "/var/tmp/scratch/opencode/colibri-runs/engine-8k-merge.log",
+  "commit": "075e92b3",
+  "provenance": "measured"
+ },
+ {
+  "cell": "reference-b12676-8k",
+  "prompt_tokens": 8027,
+  "prompt_tok_s": 156.3,
+  "prefill_s": 51.36,
+  "decode_tok_s": 21.4,
+  "log": "/var/tmp/scratch/opencode/colibri-runs/dspark-8K-nomd.log",
+  "provenance": "measured"
+ },
+ {
+  "cell": "upstream-claim",
+  "source": "CHANGELOG (c4cee56f)",
+  "hardware": "RTX PRO 4000",
+  "quant": "UD-Q4_K_XL",
+  "prompt_tokens": 570,
+  "decode_tok_s": "40.9-41.1",
+  "note": "different card and quant: 16.6 GB of Q4_K_XL on a card whose memory holds more of it, against 11.66 GB IQ3_XXS in 12 GB here. Our branch merges that code, so the difference at this cell is card+quant, not the engine."
+ }
+]

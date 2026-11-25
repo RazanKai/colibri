@@ -1149,6 +1149,34 @@ appear with the NVFP4 case compiled out, so they are **pre-existing on the merge
 change; `bench/gate.sh` is green and the engine's decode path runs. Whether dev's own tree passes
 that test (i.e. whether the merge or dev is at fault) is the open question.
 
+## 15.17 Decode parity by context: the 40 tok/s claim and our own card
+
+Upstream's CHANGELOG advertises **40.9–41.1 tok/s** of decode (`c4cee56f`, Inkling-2-Mini on the
+CUDA chain). That cell is an **RTX PRO 4000, UD-Q4_K_XL (16.6 GB), 100 tokens after a 570-token
+prompt** — a bigger card and a heavier quant than this box: 11.66 GB IQ3_XXS in 12 GB with q4 KV.
+This branch now *contains* that code (merged, §15.16), so at that cell shape the difference between
+the two engines would be card and quant, not our work. What we can measure is the same cell on
+this card, engine against the llama.cpp reference (b12676) — same snapshot, same q4 KV, 100 tokens,
+`OMP_NUM_THREADS=6` / `-b 512 -ub 128 --n-cpu-moe 12` (`bench/results-short-parity.json`):
+
+| prompt tokens | engine prefill | **engine decode** | b12676 prefill | b12676 decode | engine vs reference |
+|---|---:|---:|---:|---:|---:|
+| 721 | 6.0 s | **27.68 tok/s** | 5.5 s | 21.21 | **decode +30%** |
+| 8,027 | 36.8 s (218/s) | **24.25 tok/s** | 51.4 s (156/s) | 21.40 | **decode +13%, prefill 1.4×** |
+| 63,977 | 146.6–150.8 s | 19.38–19.54 | 393.1 s | 19.96 | decode −3%, prefill 2.6–2.7× |
+
+Short context is where the engine leads and where upstream's headline lives: on this card the
+engine is 30% ahead of the reference at 721 tokens and 13% at 8K. By 64K the reference catches up
+on decode (−3% for us, §15.15) while we stay 2.6× ahead on prefill, and at 250K the comparison
+does not exist: dev has no typed KV, so a 12 GB card cannot hold 250K at f16 (4.6 GiB a side), and
+only this branch runs that cell (12.22 tok/s, needle found, §14.9 — measured before the merge; the
+post-merge 139K/250K cells are the next ones to re-take, 64K having gone 17.07 → 19.4 with the
+merge).
+
+So: **not better than the 40.9 figure on this hardware, and not comparable to it** — the 40.9 is a
+bigger card with a heavier quant at 570 tokens. On the same card, same quant, same settings the
+engine is 30% ahead of the reference at 721 tokens, 13% at 8K, level at 64K, and alone at 250K.
+
 ## Appendix — benchmark commands
 
 ```bash
