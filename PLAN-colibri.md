@@ -1092,6 +1092,63 @@ Against the engine on this tree:
    tier keys slots by *physical* layer (`slot(layer, eid)`, `all = L*E` = 3,072) while the loop's
    `v` is the state layer, so the 48 visits share one expert slot each — no duplication to fix.
 
+## 15.16 Synced to dev, and what this branch still holds (2026-11-25/26)
+
+**The sync.** The branch forked at `a4c91f81` (2026-11-22); dev is at `c29ac0a1`, 6,328 commits
+later. Merged as `2285cada` on `kv-longctx-sync` (then fast-forwarded here). A correction to §15.15's
+account: our fork point **already carried dev's Inkling-2 batch** — #2964 re-merged it with rewritten
+hashes, so `c4cee56f`'s content was in our base all along. The merge was therefore **2 files and 3
+hunks**, not a rewrite:
+
+- `backend_cuda.cu`, `hcg_tile`'s signature and GLU epilogue: dev's newer template (`PACKED`,
+  `PARTIAL_GLU`, `PAIR_CODES`, `void *X`, the `Yu` output, the INT8 pair-code store) kept whole,
+  with this branch's Inkling-2 additions re-applied as defaulted parameters (`act/ta/tb/s_in/s_out`)
+  and `moe_glu3`; the epilogue keeps `PARTIAL_GLU`'s store and takes the activation and the
+  per-expert scales otherwise.
+- `cuda_chain.cu`, `cc_moe`'s guard: dev's line plus our "a GGUF's block formats take act and
+  esc_off on a prompt chunk's tiles"; dev's newer `hid_floats` / `tiled_experts` checks below stay.
+
+Everything else merged textually: `ink_kv.h`, `cuda_inkc.cuh`, `inkling2_cuchain.h`, `inkling.c`
+and `inkling2_chain.h` stayed as this branch has them.
+
+**What this branch still holds over dev** (all verified present in the merged tree, and absent from
+`origin/dev`):
+
+| ours | where | measured |
+|---|---|---|
+| the typed KV cache, f16/q8/q4 rows | `c/ink_kv.h`, `ink_kv_put/get/row_bytes` | 250K on 12 GB: 1,678 s prefill, 12.22 tok/s, the 250K needle found (§14.9); dev has no typed KV at all |
+| the tiled prompt attention | `ccg_relattn_qt*`, `COLI_CUDA_RELATTN_QT/ROWS` in `cuda_inkc.cuh` (ours 767 lines, dev's 290) | 1.03 → 5.02 TFLOP/s at 250K, 1,024 rows (§14.2) |
+| the GQA decode kernel | `ccg_relattn_dec_k`, `COLI_CUDA_RELATTN_GQA` | 8.03 → 4.15 ms a global layer at 250K q4, 1.94× (§14.3) |
+| prompt-row expert tiles with SiTU-GLU, the per-expert scales and NVFP4 down | `moe_glu3`, `hcg_tile`'s `act/ta/tb/s_in/s_out`, `esc_off` in `hcg_moe_*_bd_k` | dev still refuses `act`, `esc_off` and NVFP4 for rows > 8 |
+| a prompt chunk's experts in the frame | `COLI_CUDA_CHAIN_PROMPT_MOE` in `inkling2_cuchain.h` | 64K prefill 146.6–150.8 s against 254.2 s on the default path (§15.14) |
+| the microbench and the result rows | `c/tests/bench_cuda_moe.cu`, `bench/results-*.json` | §15.11 |
+
+**What the sync brought.** 6,328 commits: the tier's host pool, streaming and sub-batches; the
+feature system (`cc_uses_feature`, `Q36_EXPERT_MATMUL`, `cc_moe_tiled_*`, the tiled expert GEMM);
+`hcg_tile`'s f16/INT8-pair paths; and the newer qwen36/qwen38/GLM/DSV4 chains. On this box it
+shows: 64K default path **254.2 s / 18.65 tok/s** (was 265.1 / 17.27 before the merge), prompt-MoE
+path **146.6–150.8 s / 19.38–19.54** (was 156.4 / 17.07); the b12676 reference is 393.1 s / 19.96
+(§15.15), so decode is back within 3% on the prompt-MoE path and prefill is 2.7×.
+
+**What was taken from llama.cpp / unsloth and implemented: NVFP4's decoder.** Measured first: at
+the same gate/up type, a layer with an NVFP4 down (L9) cost 7.87 ms a prompt layer-step against
+6.69 ms for one with IQ4_NL (L20) — 1.18 ms, 15%, in the *float* block decoder (`bdf_decode`: eight
+byte loads and two `ldexpf` a 32-weight unit). `bd_dec16h` now has an NVFP4 case (the fast path
+`hcg_fetch_w<100>` tries first): the E2M1 magnitudes computed instead of table-read, the sub-block
+scale from the byte, the reserved scale bytes 0 and 0x7f read as zero (the first attempt missed that
+and was 0.149 off on a 40-row test). L9 7.07 ms, within 0.4 ms of IQ4_NL; the 36-step sequence
+15.5 → 14.4 ms (−7%). Bit-identical to `bdf_decode` over full rows (random and all-0xff), and
+`tests/test_cuda_bd.cu`'s dense NVFP4 40-row tiles are back to 4.5e-05. This is unsloth #428 /
+ggml-org #32875's lesson ("NVFP4 dequant speed increase") applied to the decoder our tiles use; the
+engine-level 64K cell cannot resolve it (146.6 vs 150.8 s, inside this box's ±3%).
+
+**One thing to chase next, recorded rather than hidden.** `tests/test_cuda_bd.cu` (not wired into
+any make target here) has **63 failures** on the merged tree: `check_moe_ink2`'s SiTU checks come
+out 2–7e-7 over their tolerance, then a device loss cascades through the rest. The same failures
+appear with the NVFP4 case compiled out, so they are **pre-existing on the merge**, not from this
+change; `bench/gate.sh` is green and the engine's decode path runs. Whether dev's own tree passes
+that test (i.e. whether the merge or dev is at fault) is the open question.
+
 ## Appendix — benchmark commands
 
 ```bash

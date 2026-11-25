@@ -1,0 +1,114 @@
+[
+ {
+  "cell": "sync-64k-default",
+  "commit": "2285cada",
+  "provenance": "measured",
+  "command": "SNAP=.../iq3xxs.colibri CTX_MAX=70000 INK2_KV=q4 COLI_CUDA=1 OMP_NUM_THREADS=6 ./c/inkling -f bench/prompt-64k.txt -n 32",
+  "prompt_tokens": 63977,
+  "prefill_s": 254.2,
+  "phases_s": {
+   "fill": 3.2,
+   "expert_mm": 131.3,
+   "attn": 73.4,
+   "other": 48.0
+  },
+  "decode_tok_s": 18.65,
+  "rss_gb": 9.1,
+  "budget": {
+   "gib": 7.42,
+   "experts": 2281
+  },
+  "before_merge": {
+   "prefill_s": 265.1,
+   "decode_tok_s": 17.27,
+   "commit": "c5d6ee1d"
+  },
+  "reference_b12676": {
+   "prefill_s": 393.1,
+   "decode_tok_s": 19.96
+  },
+  "log": "/var/tmp/scratch/opencode/colibri-runs/sync-64k-default.log"
+ },
+ {
+  "cell": "sync-64k-promptmoe",
+  "commit": "2285cada + the NVFP4 decoder (this tree)",
+  "provenance": "measured",
+  "command": "as above with COLI_VK_TIER_HOST=1 COLI_CUDA_CHAIN_PROMPT_MOE=1",
+  "prompt_tokens": 63977,
+  "prefill_s": [
+   146.6,
+   150.8
+  ],
+  "phases_s": {
+   "fill": 0.0,
+   "expert_mm": 0.9,
+   "attn": [
+    53.1,
+    54.9
+   ],
+   "other": [
+    94.2,
+    96.6
+   ]
+  },
+  "decode_tok_s": [
+   19.38,
+   19.54
+  ],
+  "rss_gb": [
+   10.9,
+   10.6
+  ],
+  "layer_steps_experts_in_frame": [
+   3024,
+   3024
+  ],
+  "before_merge": {
+   "prefill_s": 156.4,
+   "decode_tok_s": 17.07,
+   "commit": "c5d6ee1d"
+  },
+  "reference_b12676": {
+   "prefill_s": 393.1,
+   "decode_tok_s": 19.96
+  },
+  "logs": [
+   "/var/tmp/scratch/opencode/colibri-runs/sync-64k-promptmoe.log",
+   "/var/tmp/scratch/opencode/colibri-runs/sync-64k-promptmoe-nvfp4.log"
+  ],
+  "note": "the two runs are the same cell before and after the NVFP4 decoder change: the difference is inside this box's run-to-run spread (+/-3%), so the engine cannot resolve the kernel-level win"
+ },
+ {
+  "cell": "nvfp4-decoder-ab",
+  "provenance": "measured",
+  "bench": "c/tests/bench_cuda_moe.cu (MOEB_LAYER, MOEB_REPS=3 MOEB_N=2296)",
+  "question": "what does the prompt tiles' NVFP4 down decoder cost against IQ4_NL's of the same bytes?",
+  "before": {
+   "layer6_iq2s_nvfp4_ms": 7.94,
+   "layer9_iq3xxs_nvfp4_ms": 7.87,
+   "layer20_iq3xxs_iq4nl_ms": 6.69,
+   "sequence_overlap_ms": 15.19,
+   "sequence_serial_ms": 15.52
+  },
+  "after": {
+   "layer6_iq2s_nvfp4_ms": 7.14,
+   "layer9_iq3xxs_nvfp4_ms": 7.07,
+   "layer20_iq3xxs_iq4nl_ms": 6.71,
+   "sequence_overlap_ms": 14.43,
+   "sequence_serial_ms": 14.68
+  },
+  "reading": "the float decoder cost 1.18 ms a layer-step more than IQ4_NL's on the same shape (15% of the step); bd_dec16h's NVFP4 case brings it within 0.4 ms of IQ4_NL (-10% on the NVFP4 layers, -5% on the 36-step sequence)",
+  "correctness": [
+   "bit-identical to bdf_decode over full 2048-wide rows (random bytes and all-0xff; the reserved scale bytes 0 and 0x7f must read as zero, which was the first bug)",
+   "tests/test_cuda_bd.cu: NVFP4 dense 40-row tiles within 4.5e-05 of the dequantized rows (the same as before the change; 0.149 while the reserved bytes were wrong)",
+   "the new prompt-row cases (S 16/40, IQ2_S or IQ3_XXS with NVFP4 or IQ4_NL down) pass"
+  ]
+ },
+ {
+  "cell": "test-cuda-bd-known-failures",
+  "provenance": "measured",
+  "commit": "2285cada",
+  "result": "63 failures on the merged tree, all in check_moe_ink2's SiTU checks (2e-7 to 7e-7 over its tolerance) and the device loss that follows them; the same set with the NVFP4 decoder case compiled out (-DCOLI_BD_NO_NVFP4H=1), so they are pre-existing on the merge, not from this change",
+  "note": "tests/test_cuda_bd.cu is not wired into a make target or CI here; bench/gate.sh (cuda-inkc-check + the needle) is green on the same tree. The engine's own decode path (the 64K cells) runs and retrieves. Recorded, not fixed."
+ }
+]
