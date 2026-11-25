@@ -6,21 +6,51 @@
   "provenance": "measured",
   "command": "SNAP=.../iq3xxs.colibri CTX_MAX=70000 INK2_KV=q4 COLI_CUDA=1 OMP_NUM_THREADS=6 COLI_VK_TIER_HOST=1 COLI_CUDA_CHAIN_PROMPT_MOE=1 ./c/inkling -f <needle_depth.build(64,000 tokens)> -n 32",
   "box": "RTX 5070 12 GB sm_120, i5-10400F, 23 GB RAM, CUDA 13.4; one GPU process at a time",
-  "prompt": "needle_depth.build(int(64000*5.52), random.Random(11)): the three facts at 10/50/90%",
-  "prompt_tokens": 64000,
+  "prompt": "needle_depth.build(int(64000*5.52), random.Random(11)): the three facts at 10/50/90%. The generator's 5.52 chars/token says 64,000; the model's tokenizer reads 69,651",
+  "prompt_tokens": 69651,
   "ctx_max": 70000,
   "kv": "q4",
   "log": "/var/tmp/scratch/opencode/colibri-runs/needle-64k-promptpath.log",
   "prefill_s": 162.0,
-  "phases_s": {"fill": 0.0, "expert_mm": 1.8, "attn": 53.2, "other": 109.6},
-  "decode_tune": {"tokens": 31, "s": 2.527, "tok_s": 12.27},
+  "phases_s": {
+   "fill": 0.0,
+   "expert_mm": 1.8,
+   "attn": 53.2,
+   "other": 109.6
+  },
+  "decode_tune": {
+   "tokens": 31,
+   "s": 2.527,
+   "tok_s": 12.27
+  },
   "rss_gb": 10.6,
   "device_mib": 1163.6,
-  "budget": {"gib": 7.01, "experts": 2150},
-  "host_pool": {"gib": 3.0, "experts": 922, "note": "2150 + 922 = 3,072: every expert of every layer present, which is what the prompt path requires"},
-  "frame": {"layer_steps_experts_in_frame": 3312, "host_routed_ms": 1771.9, "wait_ms": 53183.5},
-  "needle": {"facts_found": 3, "of": 3, "generation": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27."},
-  "buffers": {"ids_kib": 3072.0, "w_kib": 3072.0, "hid_mib": 108.1, "y_mib": 9.0, "kvl_mib": 384.0}
+  "budget": {
+   "gib": 7.01,
+   "experts": 2150
+  },
+  "host_pool": {
+   "gib": 3.0,
+   "experts": 922,
+   "note": "2150 + 922 = 3,072: every expert of every layer present, which is what the prompt path requires"
+  },
+  "frame": {
+   "layer_steps_experts_in_frame": 3312,
+   "host_routed_ms": 1771.9,
+   "wait_ms": 53183.5
+  },
+  "needle": {
+   "facts_found": 3,
+   "of": 3,
+   "generation": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27."
+  },
+  "buffers": {
+   "ids_kib": 3072.0,
+   "w_kib": 3072.0,
+   "hid_mib": 108.1,
+   "y_mib": 9.0,
+   "kvl_mib": 384.0
+  }
  },
  {
   "cell": "prompt-moe-64k-A",
@@ -28,19 +58,42 @@
   "commit": "the same commit",
   "provenance": "measured",
   "command": "as B, but COLI_CUDA_CHAIN_MOE=0",
-  "prompt_tokens": 64000,
+  "prompt_tokens": 69651,
   "ctx_max": 70000,
   "kv": "q4",
   "log": "/var/tmp/scratch/opencode/colibri-runs/needle-64k-hostpath.log",
   "prefill_s": 267.0,
-  "phases_s": {"fill": 0.0, "expert_mm": 132.7, "attn": 84.2, "other": 52.5},
-  "decode_tune": {"tokens": 31, "s": 2.397, "tok_s": 12.94},
+  "phases_s": {
+   "fill": 0.0,
+   "expert_mm": 132.7,
+   "attn": 84.2,
+   "other": 52.5
+  },
+  "decode_tune": {
+   "tokens": 31,
+   "s": 2.397,
+   "tok_s": 12.94
+  },
   "rss_gb": 9.1,
   "device_mib": 1044.9,
-  "budget": {"gib": 7.49, "experts": 2304},
-  "host_pool": {"gib": 2.5, "experts": 768},
-  "frame": {"layer_steps_experts_in_frame": 0, "host_routed_ms": 165154.3, "wait_ms": 84214.0},
-  "needle": {"facts_found": 3, "of": 3, "generation": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27."}
+  "budget": {
+   "gib": 7.49,
+   "experts": 2304
+  },
+  "host_pool": {
+   "gib": 2.5,
+   "experts": 768
+  },
+  "frame": {
+   "layer_steps_experts_in_frame": 0,
+   "host_routed_ms": 165154.3,
+   "wait_ms": 84214.0
+  },
+  "needle": {
+   "facts_found": 3,
+   "of": 3,
+   "generation": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27."
+  }
  },
  {
   "cell": "prompt-moe-timing-64k",
@@ -53,12 +106,30 @@
   "ctx_max": 70000,
   "log": "/var/tmp/scratch/opencode/colibri-runs/engine-64k-promptmoe.log",
   "prefill_s": 156.4,
-  "phases_s": {"fill": 0.0, "expert_mm": 0.5, "attn": 55.2, "other": 101.5},
-  "decode_tune": {"tokens": 15, "s": 0.879, "tok_s": 17.07},
+  "phases_s": {
+   "fill": 0.0,
+   "expert_mm": 0.5,
+   "attn": 55.2,
+   "other": 101.5
+  },
+  "decode_tune": {
+   "tokens": 15,
+   "s": 0.879,
+   "tok_s": 17.07
+  },
   "rss_gb": 9.2,
-  "budget": {"gib": 7.01, "experts": 2150},
-  "host_pool": {"gib": 3.0, "experts": 922},
-  "frame": {"layer_steps_experts_in_frame": 3024, "host_routed_ms": 530.1}
+  "budget": {
+   "gib": 7.01,
+   "experts": 2150
+  },
+  "host_pool": {
+   "gib": 3.0,
+   "experts": 922
+  },
+  "frame": {
+   "layer_steps_experts_in_frame": 3024,
+   "host_routed_ms": 530.1
+  }
  },
  {
   "cell": "prompt-moe-262k-context",
@@ -67,7 +138,10 @@
   "provenance": "measured",
   "command": "needle_depth.py --tokens 64000 with CTX_MAX=262144 hard-coded, both MoE settings",
   "result": "no: the tier's budget is 5.14-5.17 GiB (1,561-1,571 experts) and the host pool 410 experts (1.50 GiB, RAM-capped), so no layer has all 128 present and the chain takes 0 of 24 ('a prompt chunk's of 0 more'). Prefill 323.3 s (path asked for) against 318.8 s (COLI_CUDA_CHAIN_MOE=0): a wash, both the host's step, needle 3/3 both.",
-  "logs": ["/var/tmp/scratch/opencode/colibri-runs/needle-depth-64k-promptmoe.log", "/var/tmp/scratch/opencode/colibri-runs/needle-depth-64k-hostmoe.log"],
+  "logs": [
+   "/var/tmp/scratch/opencode/colibri-runs/needle-depth-64k-promptmoe.log",
+   "/var/tmp/scratch/opencode/colibri-runs/needle-depth-64k-hostmoe.log"
+  ],
   "consequence": "the path's requirement is that every expert of a layer be present: the VRAM residents plus a host pool big enough for the rest. At a 64K-served context that is 2,150 + 922 = 3,072 with 3.0 GiB of pinned RAM; at a 262K-served context the engine's KV/state leave ~1.5 GiB to the pool, so the path declines. A 250K run would need either a larger pool (RAM) or the per-step staging copies instead of the pool."
  },
  {
@@ -78,10 +152,22 @@
   "command": "as the timing cell, without COLI_VK_TIER_HOST and without COLI_CUDA_CHAIN_PROMPT_MOE",
   "log": "/var/tmp/scratch/opencode/colibri-runs/engine-64k-default-dbfe4cb.log",
   "prefill_s": 265.1,
-  "phases_s": {"fill": 2.9, "expert_mm": 136.6, "attn": 78.3, "other": 49.1},
-  "decode_tune": {"tokens": 31, "s": 1.795, "tok_s": 17.27},
+  "phases_s": {
+   "fill": 2.9,
+   "expert_mm": 136.6,
+   "attn": 78.3,
+   "other": 49.1
+  },
+  "decode_tune": {
+   "tokens": 31,
+   "s": 1.795,
+   "tok_s": 17.27
+  },
   "rss_gb": 8.8,
-  "budget": {"gib": 7.49, "experts": 2305},
+  "budget": {
+   "gib": 7.49,
+   "experts": 2305
+  },
   "compare": "the published 64K baseline (commit b1f0c26, bench/results-whole.json) is 248.0 s / 17.77-18.09 tok/s: this tree's default path is +6.9% prefill and -2% decode on the same prompt and settings",
   "attribution": "not the flag (with it off the path is unchanged by construction: ink2cc_prompt_moe() short-circuits before any allocation, vram_need keeps the 8-row estimate, dm_onp is never set, and the tile epilogue's new arguments default to the old arithmetic for NW==1). Either the eight commits between b1f0c26 and e1470cd or the box (page cache, thermals). Unattributed; a re-baseline at b1f0c26 settles it. The A/B pair above is unaffected (both arms ran tonight on this tree)."
  },
@@ -89,6 +175,6 @@
   "cell": "prompt-moe-decision",
   "provenance": "derived from the measured pair above",
   "decision": "the chosen path is implemented behind COLI_CUDA_CHAIN_PROMPT_MOE (default 0) and measured at 64K: prefill 267.0 -> 162.0 s on the same prompt and context (-39%), decode 12.94 -> 12.27 tok/s (-5%), the 3-fact needle 3/3 both ways. Against the published 64K baseline of 248.0 s / 17.77-18.09 tok/s (host pool off, another commit and prompt), the path plus its pool is 156.4 s on the timing prompt (-37%) with decode 17.07 tok/s: the pool is what costs decode (the tier copies pooled experts into its slots), not the prompt tiles",
-  "open": "a 250K-class cell (the pool cannot hold the non-residents there); the per-step staging variant instead of the pool (§15.11's measured 15.4 ms a layer-step); the pool's decode cost (32% in the needle-prompt pair against the pool-off baseline, 5% between A and B)"
+  "open": "a 250K-class cell (the pool cannot hold the non-residents there); the per-step staging variant instead of the pool (\u00a715.11's measured 15.4 ms a layer-step); the pool's decode cost (32% in the needle-prompt pair against the pool-off baseline, 5% between A and B)"
  }
 ]

@@ -1,0 +1,59 @@
+[
+ {
+  "cell": "reference-b12676-64k",
+  "question": "Does the latest unsloth prebuilt (b12676-mix, upstream b12676 + ~45 pinned PRs) change the llama.cpp reference rows we compared the engine against?",
+  "provenance": "measured",
+  "build": "unslothai/llama.cpp b12676-mix-c32dcc8, published 2026-11-25T03:26Z, upstream base b12676 (commit d35dc4d9), asset app-b12676-mix-c32dcc8-linux-x64-cuda13-portable.tar.gz (440 MiB)",
+  "previous_build": "b12588-mix-c0c3de8, 2026-11-20T23:22Z (the rows in bench/results-dspark.json)",
+  "box": "RTX 5070 12 GB sm_120, i5-10400F, 23 GB RAM, CUDA 13.4; one GPU process at a time",
+  "model": "Inkling-2-Mini-UD-IQ3_XXS.gguf",
+  "settings": "-ngl 99 --n-cpu-moe 12 -c 65536 -ctk q4_0 -ctv q4_0 -fa on -b 512 -ub 128 --parallel 1; temp 0, cache_prompt=false, 32 tokens (PLAN 15.6's settings)",
+  "prompt": "bench/prompt-64k.txt",
+  "prompt_tokens": 63977,
+  "cells": [
+   {"flags": "(none)", "prompt_tok_s": 162.77, "decode_tok_s": 19.96, "wall_s": 394.7, "load_s": 18.0,
+    "log": "/var/tmp/scratch/opencode/colibri-runs/dspark-64K-nomd.log", "vs_b12588": "prompt 137.2 (+18.6%), decode 16.20 (+23.2%)"},
+   {"flags": "-md dspark-Inkling-2-Mini-Q8_0.gguf --spec-type draft-dspark --spec-draft-n-max 3", "prompt_tok_s": 161.15, "decode_tok_s": 16.52, "wall_s": 399.0, "load_s": 4.1,
+    "draft": {"accepted": 18, "generated": 36, "rate": 0.5, "mean_len": 2.5, "accepted_per_verify": 1.5},
+    "log": "/var/tmp/scratch/opencode/colibri-runs/dspark-64K-md.log",
+    "vs_b12588": "prompt 138.1, decode 17.19 (+6.1% over its own no-md), draft 21/27 (0.778), 2.33/verify",
+    "note": "on b12676 the drafter now HURTS at 64K: 19.96 -> 16.52 tok/s (-17%), acceptance 0.500 against 0.778. Observed, not explained: the fused draft path plus the padded-layout drafter is unslothai/llama.cpp#405's new code"},
+   {"flags": "--moe-cache-mib auto", "prompt_tok_s": 158.82, "decode_tok_s": 19.32, "wall_s": 404.6, "load_s": 4.1,
+    "log": "/var/tmp/scratch/opencode/colibri-runs/llama-64k-moecache.log",
+    "note": "the fitter left ~3.2 GiB free and allocated no useful cache on this 12 GB fit: decode 19.32 against 19.96 without it (unslothai/llama.cpp#421's win needs a cache the fit does not leave here)"}
+  ]
+ },
+ {
+  "cell": "reference-b12676-139k",
+  "question": "The ~139K class cell the previous build could not load at all (PLAN 15.13).",
+  "provenance": "measured",
+  "build": "b12676-mix-c32dcc8",
+  "settings": "as the 64K pair, -c 143360 (the prompt is 139,421 tokens), no -md",
+  "prompt": "bench/prompt-128k.txt (the 3-fact depth prompt; 139,421 tokens under the tokenizer)",
+  "prompt_tokens": 139421,
+  "prompt_tok_s": 174.59,
+  "prefill_s": 798.6,
+  "decode_tok_s": 17.96,
+  "load_s": 4.0,
+  "wall_s": 800.6,
+  "content_head": "7X4Q-ALPHA-93, PUMP-41-BRAVO-77, K9-ORBIT-27.",
+  "needle": {"facts_found": 3, "of": 3},
+  "log": "/var/tmp/scratch/opencode/colibri-runs/dspark-140K-nomd.log",
+  "vs_previous_build": "b12588 failed to load this cell: graph_reserve: failed to allocate compute buffers (3.52 GB) at -c 131072. b12676 loads and serves it: the dense relative-bias mask that needed the buffer is chunked over query rows (unslothai/llama.cpp#385) and read inside the vector flash attention (#413)",
+  "log_previous": "/var/tmp/scratch/opencode/colibri-runs/dspark-128K-nomd-b12588.log"
+ },
+ {
+  "cell": "engine-vs-reference",
+  "provenance": "measured rows above and in bench/results-prompt-moe.json / results-128k.json",
+  "table": [
+   {"size": "64K, 63,977 tok", "engine_prefill_s": 156.4, "engine_decode_tok_s": 17.07, "ref_prefill_s": 393.1, "ref_decode_tok_s": 19.96,
+    "engine_row": "prompt-MoE path, bench/results-prompt-moe.json 'prompt-moe-timing-64k'"},
+   {"size": "64K, 63,977 tok, engine default path", "engine_prefill_s": 265.1, "engine_decode_tok_s": 17.27, "ref_prefill_s": 393.1, "ref_decode_tok_s": 19.96,
+    "engine_row": "bench/results-prompt-moe.json 'default-path-64k'"},
+   {"size": "~139K, 139,421 tok", "engine_prefill_s": 697.8, "engine_decode_tok_s": 13.87, "ref_prefill_s": 798.6, "ref_decode_tok_s": 17.96,
+    "engine_row": "bench/results-128k.json 'engine-128k'"}
+  ],
+  "reading": "the engine keeps prefill: 2.5x at 64K on the prompt-MoE path (1.5x on its default path) and 1.13x at 139K. Decode flips: the b12676 reference is 16-17% faster than the engine at 64K and 29% faster at 139K, where our last published claim (PLAN 15.6) had the engine ahead by 8.9-11.7% against b12588",
+  "cause": "the b12676 pins are Inkling-2 kernel-count work: clip-row fusion (#401: 6653->5723 kernels/token), SiTU fusion (#402: ->5350, and the stack's pp512 +57% / tg128 +27% over its pin set), the short-conv chain (#411: 192 kernels replacing ~950, its share -13.1%), tanh/router/add+rms_norm (#412: -606/token), the depth mix (#414: -300/token), the rel-bias read (#413: -240/token) and banded FA (#386, in b12588 already)"
+ }
+]

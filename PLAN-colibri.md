@@ -660,6 +660,11 @@ our no-drafter path already leads llama.cpp's drafter-assisted one at 64K. The p
 is established **only up to 64K**: there is no llama.cpp 250K decode cell, so "decode work
 dropped" is not yet a 250K claim (the engine's 250K decode is 12.22 tok/s, uncompared).
 
+**Superseded by §15.15.** The rows above are unsloth `b12588`; on `b12676` (2026-11-25) the same
+64K cell is 162.8 tok/s prompt and **19.96 tok/s decode** against the engine's 17.07–17.27, and
+DSpark now *lowers* decode there (16.52). "The engine is at decode parity" is no longer true; the
+drafter decision's arithmetic (a ~6% buy) is unaffected, but re-take it on b12676 before using it.
+
 ## 15.7 Needle depth and a second fact type (250K-class)
 
 A single pass at ~96% is one fact at one depth. `bench/needle_depth.py` puts three facts of two
@@ -944,15 +949,16 @@ expert path (99 s by §15.11) and the ~163 s of other device work are the floor.
 Provenance: ms, TFLOP/s and GB/s measured; the 4.3× and the ~168 s are derived from them. The
 kernel is not written; P5 and P1.2 stay open in §14.10.
 
-## 15.13 The 128K cell, and why there is no 250K reference cell
+## 15.13 The ~139K cell, and why there is no 250K reference cell
 
-One engine cell at 128K on the same tree (the depth prompt of §15.7 generated at 128K tokens, the
-three facts at 10/50/90%), `bench/results-128k.json`, commit `a2f79b1`:
+One engine cell on the same tree (the depth prompt of §15.7's generator asked for 128,000 at its
+5.52 chars/token, which the model's tokenizer reads as **139,421**; the three facts at
+10/50/90% in a `CTX_MAX=140,000` run), `bench/results-128k.json`, commit `a2f79b1`:
 
-| | 64K (14.8) | **128K** | 250K (14.9) |
+| | 64K (14.8) | **~139K** | 250K (14.9) |
 |---|---:|---:|---:|
-| prompt tokens | 63,977 | **128,033** | 250,156 |
-| prefill | 248.0 s | **697.8 s** (183.5 tok/s) | 1,678.0 s |
+| prompt tokens | 63,977 | **139,421** | 250,156 |
+| prefill | 248.0 s | **697.8 s** (199.8 tok/s) | 1,678.0 s |
 | phases (s) | 127.0 / 71.9 / 47.5 | **expert 307.3 / attn 283.0 / other 103.9** | 658.1 / 836.4 / 180.1 |
 | decode | 17.77–18.09 tok/s | **13.87 tok/s** | 12.22 tok/s |
 | RSS | 9.7 GB | **9.8 GB** | 12.8 GB |
@@ -965,7 +971,9 @@ Prefill is sublinear per token (3.9 s/1K at 64K, 5.4 at 128K, 6.7 at 250K) and t
 the way §14.9/15.4 said they would: the expert phase tracks tokens, attention more than tracks them.
 Decode 13.87 sits between the 64K and 250K numbers, monotone in context.
 
-**The reference cannot make the same cell.** llama-server with the §15.6 settings unchanged
+**The reference could not make the same cell** — **superseded by §15.15**: build b12676 loads and
+serves 139,421 tokens at 174.6 tok/s after #385/#413 chunk/read the relative bias instead of
+materialising it. The paragraph below describes b12588. llama-server with the §15.6 settings unchanged
 (`-ngl 99 --n-cpu-moe 12 -c 131072 -ctk q4_0 -ctv q4_0 -fa on -b 512 -ub 128`) fails to load:
 `graph_reserve: failed to allocate compute buffers` (3.52 GB) and then `failed to initialize the
 context: failed to allocate compute pp buffers`, on the same card with 10.9 GiB free. So the
@@ -985,8 +993,8 @@ card, the rest in its **host pool** (`COLI_VK_TIER_HOST=1`, 3.0 GiB of pinned RA
 over the bus). Decode keeps the residents-only decision, so its path is untouched. Default 0: with
 the flag off nothing changes (the gate ran green on that path before the change).
 
-The pair at 64K, same prompt (`needle_depth.build` at 64,000 tokens, the three facts at
-10/50/90%), same context, same tree, same pool, only the switch differing
+The pair at 64K, same prompt (`needle_depth.build` at 64,000 by the generator, 69,651 tokens
+under the tokenizer, the three facts at 10/50/90%), same context, same tree, same pool, only the switch differing
 (`bench/results-prompt-moe.json`):
 
 | | A: host's step (`COLI_CUDA_CHAIN_MOE=0`) | B: the frame (`=1`) |
@@ -1030,6 +1038,59 @@ step either way (323.3 s asked for the path against 318.8 s, needle 3/3 both). S
 a 64K-class-path win measured end to end, and a 250K path needs either a bigger pool or the
 per-step staging copies §15.10 specified (whose price the microbench measured: 15.4 ms a step at
 75%, 21.1 at 56%, where the pool's per-step copies are not in that number).
+
+## 15.15 The reference moved: unsloth b12676 measured at 64K and ~139K
+
+The llama.cpp rows §15.6 and §15.13 compared against came from unsloth `b12588-mix-c0c3de8`
+(2026-11-20). The current prebuilt, `b12676-mix-c32dcc8` (2026-11-25, upstream `b12676` plus ~45
+pinned PRs), was installed beside it and the same cells re-run — same snapshot, q4 KV, `-ngl 99
+--n-cpu-moe 12 -c … -fa on -b 512 -ub 128`, temp 0, `cache_prompt=false`, 32 tokens
+(`bench/results-llama-b12676.json`; one GPU process at a time):
+
+| cell (RTX 5070 12 GB, IQ3_XXS) | b12588 | **b12676** |
+|---|---:|---:|
+| 64K, 63,977 tok, no `-md`: prompt | 137.2 tok/s | **162.8** (+18.6%) |
+| 64K, no `-md`: decode | 16.20 tok/s | **19.96** (+23.2%) |
+| 64K, `-md` DSpark: decode | 17.19 (+6.1%) | 16.52 (**−17%**) |
+| 64K, `-md`: draft accepted | 21/27, 0.778, 2.33/verify | 18/36, 0.500, 1.5/verify |
+| 64K, `--moe-cache-mib auto`: decode | — | 19.32 (the fit left no cache to size) |
+| ~139K, 139,421 tok, no `-md` | **would not load** | **loads**: 174.6 tok/s prompt, 17.96 tok/s decode |
+
+Against the engine on this tree:
+
+| size | engine prefill | engine decode | b12676 prefill | b12676 decode |
+|---|---:|---:|---:|---:|
+| 64K (prompt-MoE path) | **156.4 s** | 17.07 | 393.1 s | **19.96** |
+| 64K (engine default path) | 265.1 s | 17.27 | 393.1 s | 19.96 |
+| ~139K | **697.8 s** | 13.87 | 798.6 s | **17.96** |
+
+**What this changes.**
+
+1. **The decode-parity result of §15.6 is superseded.** The engine is not at parity at 64K any
+   more: the reference is **16–17% faster** (19.96 against 17.07–17.27) and **29% faster** at
+   ~139K (17.96 against 13.87). The whole of the gap is the b12676 pins' kernel-count work on
+   Inkling-2's own ops (clip #401 6653→5723 kernels a token; SiTU #402 →5350 with the stack's
+   tg128 +27% over its pin set; conv chain #411 192 kernels replacing ~950, its share −13.1%;
+   tanh/router/norm #412 −606; depth mix #414 −300; rel-bias #413 −240), all of which the engine
+   already does in one kernel each — so this is a *floor* the engine now has to re-earn, not a
+   curiosity. `bench/results-speed.json`'s kernels are not the comparison.
+2. **Prefill still belongs to the engine**: 2.5× at 64K on the prompt-MoE path (1.5× on its
+   default path) and 1.13× at ~139K. The ~139K prefill gap is much smaller than at 64K because
+   attention dominates there and the reference's banded FA (#386) and rel-bias fixes (#385/#413)
+   closed it.
+3. **§15.13's "the reference cannot make the cell" is fixed in b12676.** The 3.52 GB compute
+   buffer that failed at `-c 131072` was the dense `n_kv × n_ubatch × n_head` relative-bias mask;
+   #385 chunks it over query rows and #413 reads the bias inside the vector FA, so 139,421 tokens
+   now loads and retrieves 3/3. The 250K cell is therefore no longer "not obtainable" in
+   principle — it is untried at that size.
+4. **DSpark now hurts at 64K** (19.96 → 16.52, acceptance 0.500 against 0.778). Recorded, not
+   explained: it is #405's new fused draft path with the padded-layout drafter we have. Do not
+   re-run the §15.6 DSpark comparison against b12588 as if it still held.
+5. **`--moe-cache-mib auto` sizes nothing at this fit** (19.32 against 19.96). unsloth's loop-aware
+   cache fix (#421) is real — 55.7% → 81.3% hits, 4768 → 2013 GiB of expert traffic — but it needs
+   cache the 12 GB fit does not leave. The analogous check on our side came out clean: colibri's
+   tier keys slots by *physical* layer (`slot(layer, eid)`, `all = L*E` = 3,072) while the loop's
+   `v` is the state layer, so the 48 visits share one expert slot each — no duplication to fix.
 
 ## Appendix — benchmark commands
 
@@ -1318,11 +1379,12 @@ Raw log: `/var/tmp/scratch/kvtest/250k-new.err`, `/var/tmp/scratch/kvtest/250k-n
   with the vectorized unpack (P5's arithmetic) and the CPU-reference/oracle gates.
 - **P5, the vectorized q4/q8 block packer**: ~62 s at 250K in `ink2cc_kv_down`; not done. It is
   also the unpack that P1.2 needs, so the two are one change.
-- **250K decode parity**: llama.cpp was compared only at 8K/64K (§15.6). The engine now has a
-  128K cell (§15.13: prefill 697.8 s, decode 13.87 tok/s, needle 3/3), but the reference cannot
-  make one: llama-server with the §15.6 settings fails to allocate its 3.52 GB compute buffer for
-  a 131,072-token context on this card. A reference cell needs `--n-cpu-moe` raised, i.e. a
-  different setting; recorded as open with that reason.
+- **Decode parity: open again, and the reference is ahead.** b12676 (§15.15) decodes 19.96 tok/s
+  at 64K against the engine's 17.07–17.27, and 17.96 at 139,421 tokens against 13.87; the §15.6
+  "engine at parity" result was measured against b12588. The engine keeps prefill (2.5×/1.5× at
+  64K, 1.13× at ~139K). A reference 250K cell is now possible in principle (§15.15 point 3) and
+  untried; the decode gap on the engine's side is the per-op kernel count the reference's pins
+  removed, not the tier.
 - **Transfer timeline**: the prefetch-ordering statement is a code reading, not a measured
   timeline; confirm it before calling it the cause of the 11–17% overlap.
 - **M3/M4**: 1M is YaRN-only and out of scope for the 262K acceptance. The 1M requirement is
