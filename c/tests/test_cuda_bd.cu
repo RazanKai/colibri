@@ -812,6 +812,10 @@ int main(void) {
         check_moe(pairs[i][0], pairs[i][1], 40, 8, 16, 1024, 768);
     }
     for (int g : {22, 16, 29}) for (int S : {2, 4}) check_moe(g, 42, S, 10, 24, 2560, 640);   /* Qwen3.8-Flash-Next IQ2_XS's experts, a verify's rows */
+    /* a prompt chunk's rows (the block tiles) of an Inkling-2 layer: IQ2_S and IQ3_XXS gate and up with an
+     * NVFP4 or IQ4_NL down, S > CC_MOE_FRAME_ROWS so hcg_moe_dn_bd_k's decoder is the one under test
+     * (bd_dec16h's NVFP4 case against bdf_decode's) */
+    for (int S : {16, 40}) for (int td : {40, 20}) { check_moe(22, td, S, 8, 16, 1024, 768); check_moe(18, td, S, 8, 16, 1024, 768); }
     /* Inkling-2-Mini's experts in the frame: UD-Q4_K_XL's NVFP4 with their global scales, its UD-IQ2_XXS layers, Q8_0 */
     for (int S : {1, 3}) { check_moe_ink2(40, 40, S, 8, 16, 2048, 768, 1); check_moe_ink2(16, 16, S, 8, 16, 2048, 768, 0); check_moe_ink2(8, 8, S, 8, 16, 1024, 512, 1); }
     /* a prompt's rows of a layer in one call, down by slices (coli_cuda_moe_cols_async): Qwen3.8's shape, 40 experts,

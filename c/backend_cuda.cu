@@ -4065,7 +4065,10 @@ static inline int hcg_bt_wf(int fmt) {
  * apply the same expression the decode step's GEMV kernels do (moe_glu), so a row has one form
  * whichever path ran it. */
 __device__ __forceinline__ float moe_glu3(int act, float ta, float tb, float g, float u) {
-    if (act == 1) return ta * tanhf(g / ta) * (1.f / (1.f + expf(-g))) * tb * tanhf(u / tb);
+    /* the CPU's expression and grouping (inkling.c's ink_glu): ta * tanh(g/ta) * sigmoid(g) *
+     * (tb * tanh(u/tb)); the up term's product is grouped as ink_glu groups it, so a row's bits
+     * match the host's step to the last place (tests/test_cuda_bd.cu's SiTU tolerance) */
+    if (act == 1) return ta * tanhf(g / ta) * (1.f / (1.f + expf(-g))) * (tb * tanhf(u / tb));
     return (g / (1.f + expf(-g))) * u;
 }
 #if HCG_BODY

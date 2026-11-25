@@ -207,7 +207,10 @@ int main(int argc, char **argv) {
     /* the steps: 24 layer-steps, then the 12 loop layers (6..17) twice more */
     const int nst = nsteps_in == 1 ? 1 : 36;
     std::vector<int> seq(nst);
-    if (nst == 1) seq[0] = 6;                          /* one layer-step: a loop layer (IQ2_S + NVFP4) */
+    /* one layer-step: a loop layer (IQ2_S + NVFP4 down) unless MOEB_LAYER names another, e.g. 20
+     * (IQ3_XXS + IQ4_NL down) to measure one down decoder against the other */
+    if (nst == 1) { const char *e = getenv("MOEB_LAYER"); seq[0] = e && *e ? atoi(e) : 6;
+                    if (seq[0] < 0 || seq[0] >= NC) seq[0] = 6; }
     else { for (int i = 0; i < NC; i++) seq[i] = i;
            for (int i = NC; i < nst; i++) seq[i] = 6 + (i - NC) % 12; }
 

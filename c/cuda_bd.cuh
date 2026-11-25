@@ -756,7 +756,42 @@ __device__ __forceinline__ float bd_hold(float f) { return f != f ? f : fminf(fm
 __device__ __forceinline__ bd_u32 bd_bf2h2(bd_u32 v) {
     return bd_h2u(__floats2half2_rn(bd_hold(__uint_as_float(v << 16)), bd_hold(__uint_as_float(v & 0xffff0000u))));
 }
+/* NVFP4's nibble as MXFP4's E2M1 magnitude doubled (GGML_KVALUES_MXFP4: 0,1,2,3,4,6,8,12), the
+ * sign of bit 3: the same integers bdf_decode's table gives, without a table read */
+__device__ __forceinline__ float bd_e2m1(bd_u32 n) {
+    const bd_u32 mag = n & 7u;
+    float v = (float)mag + (mag > 4u ? (float)(mag - 4u) : 0.f) + (mag == 7u ? 2.f : 0.f);
+    return (n & 8u) ? -v : v;
+}
 __device__ __forceinline__ bool bd_dec16h(int t, const bd_u32 *__restrict__ W, bd_u32 e0, bd_u32 *out) {
+#ifndef COLI_BD_NO_NVFP4H
+#define COLI_BD_NO_NVFP4H 0
+#endif
+    if (!COLI_BD_NO_NVFP4H && t == 40) {   /* NVFP4: 64 weights a block - 4 scale bytes, then 32 nibble bytes; byte j of a
+                      * 16-weight sub-block holds weights j (low) and j + 8 (high) - and the value is
+                      * MXFP4's table times the sub-block's scale (bdf_decode's, without its 8 byte
+                      * loads and two ldexpf a unit: the float GEMMs' decode cost ~30% of an IQ4_NL
+                      * down of the same bytes, measured on the prompt tiles) */
+        const bd_u32 b = e0 >> 6, sb = (e0 >> 4) & 3u, base = b * 36u;
+        const bd_u32 x8 = bd_u8at(W, base + sb), e = (x8 >> 3) & 15u, m = x8 & 7u;
+        /* the two reserved bytes (0 and 0x7f) are a scale of zero, as bdf_decode holds them */
+        const float s = (x8 == 0u || x8 == 0x7fu) ? 0.f
+                        : e == 0u ? (float)m * (1.f / 1024.f) : __uint_as_float(((e + 119u) << 23) | (m << 20));
+        const bd_u32 q0 = bd_w(W, (base + 4u + 8u * sb) >> 2), q1 = bd_w(W, (base + 8u + 8u * sb) >> 2);
+        #pragma unroll
+        for (int k = 0; k < 2; k++)
+            #pragma unroll
+            for (int w = 0; w < 2; w++) {
+                const bd_u32 q = w ? q1 : q0, sh = k ? 4u : 0u, o = 2u * (bd_u32)(2 * k + w);
+                #pragma unroll
+                for (int j = 0; j < 4; j += 2) {
+                    const float v0 = bd_e2m1((q >> (8u * (bd_u32)j + sh)) & 15u) * s;
+                    const float v1 = bd_e2m1((q >> (8u * (bd_u32)(j + 1) + sh)) & 15u) * s;
+                    out[o + (bd_u32)j / 2u] = bd_h2u(__floats2half2_rn(v0, v1));
+                }
+            }
+        return true;
+    }
     if (t == 1 || t == 30) {   /* F16, BF16: the 16 values are bytes 2 e0 .. 2 e0 + 31 (16-byte aligned) */
         uint4 a = bd_w4(W, e0 >> 3), b = bd_w4(W, (e0 >> 3) + 1u);
         bd_u32 v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
