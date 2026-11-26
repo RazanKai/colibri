@@ -1238,7 +1238,8 @@ size), `gemv_multi_q8row_preq`, `moe_gu/dn_sk_fmt` and the `pf_*` attention kern
 0. **Prompt-lookup drafting first, then DSpark from the GGUF we already own.** `c/spec_draft.h`
    already holds `spec_lookup` (n-gram proposals from the context itself — no weights) and the
    "whether drafting pays" gate, and the engine's verify forward (up to 8 rows) exists. That is
-   the zero-weight half of their drafter and needs no download. Their 0.1.69 shows the second
+   the zero-weight half of their drafter and needs no download. **Done, §15.19**: +34 to +62% on the
+   bench prompts, same text. Their 0.1.69 shows the second
    half: the external DSpark drafter **from a GGUF** (`k_dspark_plain_from_gguf`) — the same
    0.40 GB `dspark-Inkling-2-Mini-Q8_0.gguf` we already have, which our engine cannot read today —
    with `--draft-beam` / `--draft-cost` / `--draft-adapt` / `--draft-vocab` deciding when and how
@@ -1267,6 +1268,131 @@ size), `gemv_multi_q8row_preq`, `moe_gu/dn_sk_fmt` and the `pf_*` attention kern
 7. **NOT their host pool at 12 GB**: with it on the VRAM expert budget collapses (2,457 → 606–724)
    and decode stays ~28. It is the prompt path's source, pinned, not a residency strategy here.
 
+## 15.19 Prompt-lookup speculation in the decode loop (+34% to +62% on the bench prompts), and why the DSpark GGUF drafter is still blocked
+
+The first half of Strata's drafter needed no weights and no download: the context proposes what follows
+itself. `INK2_SPEC=1` (`inkling.c`'s `Ink2Spec`, the chain's `nlog` in `inkling2_cuchain.h`) drafts up
+to `INK2_SPEC_DRAFTS` tokens from the token history with `spec_draft.h`'s `spec_lookup`, runs **one**
+forward of S = drafts + 1 rows, and keeps the prefix the target's own greedy picks agree with:
+
+- **The rows.** Row r is fed at `pos + r` (row 0 the token the caller just emitted), so row r's logits
+  predict `pos + r + 1` and draft r stands when row r-1 picks it. The chain computes the final norm,
+  the head and an argmax for *every* row on the card (`cc_pick_rows`) and the loop compares the picks
+  before the vocabulary comes down: only the rows that stood are read back, 0.8 MiB a row.
+- **The rollback.** A short convolution's state is the tail of the rows it saw and cannot be stepped
+  back a row at a time. The driver copies the host's convolution banks (`m->cs`, ~1.9 MiB) before the
+  verify; on a rejection it restores them, tells the chain the host's copy is newer, and feeds the
+  accepted prefix again in one forward (the same bits plain decoding gives those rows). The K/V rows
+  past the accepted prefix stay in the host ring where they are and are overwritten when those
+  positions are fed again; the mirror is only read up to the fed positions, so a rejected draft's row
+  is never attended to.
+- **The depth** is `spec_draft.h`'s gate: it measures T(n), the seconds of a forward of n rows, and the
+  acceptance by draft position from the same run, and it stops drafting when a verify is worth less
+  than a plain step (`INK2_SPEC_GATE=0` drafts every proposal, for tests).
+
+**The text does not change.** Token for token identical to `INK2_SPEC=0` at 721 (100 tokens, two
+settings against the final binary; four more earlier), 8,027 (100) and 63,977 (32), and with
+`COLI_CUDA_CHAIN_MOE=0` (the experts on the host, a different step for the verify's rows): the
+accepted drafts (65/66 at 721, 67/71 at 8K, 16/17 at 64K) are the picks plain decoding makes, which is
+the check that the chain's S-row forward gives a row the bits a one-row step gives it.
+
+Measured on this tree, this box (one GPU process, `COLI_VK_TIER_BALANCE=0`, `INK2_KV=q4`,
+`OMP_NUM_THREADS=6`; the bench prompts are the repetitive filler of `bench/make_prompts.py`, so this is
+the lookup's best case). Each row is one run of each way, back to back, same binary:
+
+| context | `INK2_SPEC=0` | `INK2_SPEC=1`, drafts 4, gate | tokens a forward | drafts kept |
+|---|---:|---:|---:|---:|
+| 721 (`-n 100`) | 35.30 | **42.21 (+20%)** | 2.91 | 98.5% (65/66) |
+| 8,027 (`-n 100`) | 34.03 | **45.86 (+35%)** | 3.09 | 94.4% (67/71) |
+| 63,977 (`-n 32`, 15.18's best config) | 24.94 | **33.07 (+33%)** | 2.07 | 94.1% (16/17) |
+| 721, `COLI_CUDA_CHAIN_MOE=0` | 34.48 | **48.34 (+40%)** | 3.00 | 98.5% (66/67) |
+
+The 721-token cell is the noisy one: the same configuration (the flag makes no difference at 721 —
+0 of 24 layers' experts run in the frame either way) measured 42.21 and 48.34 in two back-to-back
+pairs, and 48.08 against 34.55 on the run before the final rebuild, so that cell reads **+20% to
++40%** and the middle of the band is +39%. The 8K and 64K cells were stable to ~1%. Against §15.18's
+33.73 tok/s the 721 cell is +25% to +43%.
+
+Depth and gate, 721 tokens, `-n 100`, separate runs on the final binary (the same prompt and
+settings; `INK2_SPEC=0` there is the 35.30 cell above):
+
+| 721 | decode tok/s | tokens a forward | drafts kept | T(n)/T(1) measured |
+|---|---:|---:|---:|---|
+| drafts 1, gate on | 39.21 | 1.90 | 100% (47/47) | 2:1.13 |
+| drafts 4, gate on | 42.21 / 47.25 / 48.34 | 2.91-3.09 | 98.5% (67/68) | 2:1.24 3:1.40 4:1.79 5:1.90 |
+| drafts 4, gate off | **51.34** | 4.50 | 96.2% (77/80) | — |
+
+So the gate gives up about 7 points of the 45 at 100 tokens, and only because it is still learning:
+its acceptance EMAs carry a prior worth 2 verifies and a 16-verify memory, so 4.50 tokens a forward
+(what depth 4 is worth here) is reached over a few dozen verifies rather than at once (27 verifies:
+3.09 a forward in the same run). `COLI_CUDA_CHAIN_MOE=0` at 721: 34.48 → 48.34 (+40%), text identical.
+
+The verify is cheap on this chain, which is why it pays: measured T(n)/T(1) at 721 is 1.05 (2 rows),
+1.33 (3), 1.55 (4), 1.94 (5), i.e. a row costs 0.19 of a plain step (rho); the host's expert step is
+most of a plain step, so a verify's extra rows cost one expert step each, not one step's latency. At
+64K T(4)/T(1) = 1.86 (the gate only got as deep as 4 there).
+
+**What the gate does not price**: the replay a rejection costs. A rejection at the first draft pays
+T(S) + T(1) for one token. With 5-6% rejections on these prompts that is invisible; on free text the
+lookup finds fewer and shorter proposals and the acceptance EMA is what stops the drafting. The
+follow-up (an activation-row capture that makes the rollback a copy instead of a forward, §15.18 item 3)
+would remove the term.
+
+**Not wired**: `serve` mode (its decode loop is a different one), `INK2_MTP`, multi-slot decoding, and
+runs whose logits are dumped. `INK2_SPEC=0` is the default and the plain path, untouched.
+
+### The DSpark GGUF drafter: the layout, and the piece that is missing
+
+The 0.40 GB `dspark-Inkling-2-Mini-Q8_0.gguf` we own is a **3-block DFlash drafter with DSpark heads**,
+and it is not the DFlash2 drafter `c/dflash_cuda.h` was written for. Its own inventory (read from the
+file, `inspected`):
+
+- blocks `blk.0..2`: D 2,304, 24 heads / 8 KV, hd 128, FF 9,216, Q8_0 (type 8); `attn_q`, `attn_k`,
+  `attn_v`, `attn_output`, `ffn_gate/up/down`, per-head `attn_q_norm`/`attn_k_norm`, `dflare_norm`,
+  and **`attn_k_ctx`/`attn_v_ctx` + `attn_k_ctx_norm`** (the target's context injected as K/V, as
+  DFlash2's `k_ctx`/`v_ctx`);
+- heads: `dspark_fuse.weight` (4x4, f32), `dspark_hidden_out.weight` (256->2304) + bias,
+  `dspark_norm`, `joint_proj.weight` (5120->768) + bias, **`markov_w1.weight` (256->201,024)** and no
+  `markov_w2`, `mask_embd.weight` (2304x7), `output_norm`;
+- metadata: `dflash.target_layers = [5, 23, 41, 48]` (the loop's step numbers), `block_size 8`,
+  `sample_from_anchor false`, `has_confidence_head false`, `attention.causal false`,
+  `sliding_window 1024` with pattern `[true,false,true]`, `rope.dimension_count 128`,
+  `freq_base 1e6`, `final_logit_softcapping 30`, markov rank 256, vocab 201,024 padded / 200,058.
+
+The missing piece is the **model-side graph of this variant**: how the four taps are fused (a 4x4
+matrix per channel?), what `joint_proj`'s 5,120 inputs are — 2x256 markov + 2x2,304 hidden, i.e. the
+block's row twice — and how the markov state, `dspark_hidden_out` (256->2304) and `dspark_norm` make
+the drafts' logits with a single `markov_w1` where DeepSeek's own DSpark has `w1` (an embedding) and
+`w2` (the bias). No source on this box has it: `/home/nazar/opt/llama.cpp/src-inkling` (master,
+2026-11-20+) has `markov_w1/w2`, `joint_proj` and `mask_embd` for DeepSeek-V4/4.1's DSpark
+(`c/deepseek_v4_dspark.inc` is our copy of that design) but **no `dspark_fuse`, no
+`dspark_hidden_out`, and no Inkling dflash variant**; the b12676 build that loads this file is a binary
+with no source here. `c/dflash_cuda.h`'s `df_load` wants `config.json` + `dflash_config` in a
+safetensors directory, `fc.weight`, `hidden_norm`, `layers.N.*`, `candidate_selector.*` and the
+DFlash2 two-tap convs — none of which this GGUF has. Writing the forward from the shapes alone would be
+guesswork against a drafter whose acceptance *is* the whole payoff, which is what the prompt forbids.
+
+The numbers we do have, for the record (`bench/results-dspark.json`, reference b12588, same card and
+quant, `-md` + `--spec-type draft-dspark --spec-draft-n-max 3`): draft acceptance 77.8% (21/27),
+mean length 3.33, 2.33 accepted a verify; decode **18.66 → 19.60 tok/s at 8K (+5%)** and
+**16.20 → 17.19 at 64K (+6%)**. On b12676 the same drafter measured acceptance 0.500 at 64K and made
+decode worse (19.96 → 16.52) — the dead end §15.18 already records. Our lookup path above is
+comparable on the repetitive bench prompts (which is where it is strongest) and needs no weights; what
+DSpark would add is free text, where this drafter is the only candidate and the wiring is missing.
+
+### The two decode-side items of §15.18, not attempted tonight
+
+Both are kernel work on the chain and neither is a decode win at this size: (a) the activation row
+quantized once a visit (`cc_*` op + the dense path) is a new op behind the same gates; (b) the KV row
+packer is **prefill**-side — `ink2cc_kv_down` is 15.8 s of the 46.6 s `other` at 64K, but a decode step
+packs 24 layers x 1024 values, ~2 ms of a 40 ms step, so moving it to the card would not move decode
+(§14.6 priced it at ~62 s of a 250K *prefill*). The next decode-side work is the one §15.19 measured
+in passing: the replay a rejected verify costs (T(keep) a rejection), which an activation-row capture
+would turn into a copy and which would let the gate draft deeper on free text.
+
+
+
+```bash
 ## Appendix — benchmark commands
 
 ```bash

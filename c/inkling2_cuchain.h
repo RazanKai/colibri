@@ -54,6 +54,7 @@ typedef struct {
     int cs_where, host_zero;
     CcBuf *x, *res, *blk, *hq, *hk, *hv, *nq, *nk, *nv, *q, *kvs, *r, *gt, *ctx, *a, *mo, *dyn, *ts, *lg, *fin;
     CcBuf *h2d, *lgd, *kvd, *csd, *outd, *xd, *routed;
+    CcBuf *vfin, *vlog, *vpick;                 /* a speculative verify: every row's final norm, logits, picks */
     CcBuf *xpre, *xprev, *pblk, *msg[4], *hn2, *lz, *lf, *lgv;   /* the loop's passes */
     /* the routed experts in the frame: the table ([L][E] CcExpert, then the scales' pairs at
      * dm_esc_off bytes), per layer whether it runs there and cc_moe's formats; the ids [NS][8][K]
@@ -202,7 +203,8 @@ static void ink2cc_free_own(Model *m, Ink2CuChain *ch) {
     }
     for (int v = 0; v < ch->NS; v++) { cc_free(ch->kc[v]); cc_free(ch->vc[v]); ch->kc[v] = ch->vc[v] = NULL; }
     ch->t_lm = NULL;
-    CcBuf **dm[] = {&ch->dm_tab, &ch->dm_ids, &ch->dm_w, &ch->dm_hid, &ch->dm_y, &ch->kvl};
+    CcBuf **dm[] = {&ch->dm_tab, &ch->dm_ids, &ch->dm_w, &ch->dm_hid, &ch->dm_y, &ch->kvl,
+                    &ch->vfin, &ch->vlog, &ch->vpick};
     for (size_t k = 0; k < sizeof dm / sizeof dm[0]; k++) { cc_free(*dm[k]); *dm[k] = NULL; }
     ch->dm_read = 0; ch->dm_state = -1;
     cc_free(ch->rings); ch->rings = NULL;
@@ -786,10 +788,14 @@ static void ink2cc_dmoe_done(Ink2CuChain *ch, Model *m, int i, int v, int n, int
 }
 
 /* Every layer for S rows from host rows xh, the last row's logits (softcapped) into `logit`;
- * xh gets the rows the final norm reads (the output mix applied) when want_x. 0 = not taken:
+ * xh gets the rows the final norm reads (the output mix applied) when want_x. `nlog` > 1: a
+ * speculative verify -- the final norm, lm_head and an argmax (cc_pick_rows) for every one of
+ * the S rows, the picks left in ch->vpick (two words a row, the token and its probability) and
+ * the logits in ch->vlog (device), read a row at a time by ink2cc_verify_row; `logit` is then
+ * not written. 0 = not taken:
  * xh is as it was and the caller runs the step on the CPU (after ink2cc_recover when the device
  * was lost). 1 = taken. */
-static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit) {
+static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, float *logit, int nlog) {
     if (!g_cu_chain) return 0;
     if (g_cu_chain == 2 && S <= 2) return 0;   /* prompts only: decode on the CPU */
     if (m->mux_rows) return 0;
@@ -803,6 +809,16 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
         fprintf(stderr, "[CUDA] inkling2 chain: device memory for %d rows refused; per-matrix path\n", rows);
         ink2cc_free_own(m, ch);
         ch->failed = 1;
+        return 0;
+    }
+    if (nlog > S) nlog = S;
+    if (nlog > 1 && (!cc_reserve(&ch->vfin, (size_t)nlog * D * sizeof(float), CC_DEV) ||
+                     !cc_reserve(&ch->vlog, (size_t)nlog * (size_t)c->unpad_vocab * sizeof(float), CC_DEV) ||
+                     !cc_reserve(&ch->vpick, (size_t)nlog * 2 * sizeof(float), CC_DOWN))) {
+        /* a verify's logits are the only thing refused: nothing is consumed, the caller runs the
+         * plain step (the chain itself is fine) */
+        static int said;
+        if (!said) { said = 1; fprintf(stderr, "[CUDA] inkling2 chain: no device memory for a verify's %d rows of logits; plain steps\n", nlog); }
         return 0;
     }
     float *xfin = want_x ? malloc((size_t)S * D * sizeof(float)) : NULL;
@@ -947,11 +963,18 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->hq, 0, (size_t)n * D);
         if (ok && ch->csd_n) ok = cc_copy(ch->csd, 0, ch->rings, 0, ch->csd_n);   /* the convolution states, for the host */
         int last = c0 + n == S;
-        if (ok && last) {
+        if (ok && last && nlog <= 1) {
             CcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, D, c->mup};
             CcNorm fp = {1, D, 1, (n - 1) * D, D, D, 0, D, D, (int)ch->o_final, 0, 0, c->eps, 1.f};
             ok = cc_norm(ch->hq, ch->prm, ch->fin, &fp) && cc_sconv(ch->fin, NULL, NULL, &dv) &&
                  cc_matmul(ch->t_lm, ch->fin, 0, ch->outd, 0, 1);
+        }
+        if (ok && nlog > 1) {   /* a verify: the final norm, the head and the argmax of every row */
+            CcSconv dv = {2, 0, 0, 0, 0, 0, 0, 0, n * D, c->mup};
+            CcNorm fp = {n, D, 1, 0, D, D, 0, D, D, (int)ch->o_final, 0, 0, c->eps, 1.f};
+            ok = cc_norm(ch->hq, ch->prm, ch->vfin, &fp) && cc_sconv(ch->vfin, NULL, NULL, &dv) &&
+                 cc_matmul(ch->t_lm, ch->vfin, 0, ch->vlog, (size_t)c0 * c->unpad_vocab, n) &&
+                 cc_pick_rows(ch->vlog, (size_t)c0 * c->unpad_vocab, ch->vpick, c->unpad_vocab, n);
         }
         double t0 = now_s();
         ok = ok && cc_submit(1);
@@ -964,7 +987,7 @@ static int ink2cc_forward(Model *m, float *xh, int S, int pos_base, int want_x, 
             memcpy(m->cs[b][i], csd + ch->o_csd[(size_t)b * ch->NS + i], (size_t)ink_cs_cells(c, b, i) * sizeof(float));
         ch->cs_where = INK2CC_BOTH; ch->host_zero = 0;
         if (want_x) memcpy(xfin + (size_t)c0 * D, cc_ptr(ch->xd), (size_t)n * D * sizeof(float));
-        if (last) {
+        if (last && nlog <= 1) {
             memcpy(logit, cc_ptr(ch->outd), (size_t)c->unpad_vocab * sizeof(float));
             ink2_head_post(c, logit, c->unpad_vocab);
         }
@@ -978,6 +1001,63 @@ lost:   /* a frame failed: the device is gone (or would not take a command); the
     free(xfin); free(dq);
     ink2cc_recover(m, pos_base);
     return 0;
+}
+
+/* ---- a speculative verify's rows (INK2_SPEC=1: inkling.c's decode loop) ---------------------
+ * The decode loop drafts from the token history (spec_draft.h's spec_lookup, no weights) and
+ * asks the chain for one forward of S = drafts + 1 rows: row r is fed at pos_base + r and its
+ * logits predict pos_base + r + 1, so a draft stands when the row before it picks it. The chain
+ * leaves every row's pick and logits on the device (ink2cc_forward's nlog); the loop accepts the
+ * prefix the picks agree with, reads back the last accepted row's logits and rolls the state
+ * back to it. */
+
+/* 1 when the next forward of S rows at pos will run in this chain (the guards ink2cc_forward
+ * checks, asked before the drafts are made, so a verify is never half-run). */
+static int ink2cc_spec_ready(Model *m, int S, int pos) {
+    if (g_cu_chain != 1 || m->mux_rows) return 0;
+    Ink2CuChain *ch = ink2cc_of(m);
+    if (!ch || !ch->tried || !ch->ok || ch->failed) return 0;
+    if (!cc_pick_rows_ready() || S < 2 || S > CC_MOE_FRAME_ROWS || pos < 0 || pos + S > m->max_t) return 0;
+    return 1;
+}
+/* The verify's row r token (the argmax of its logits, lowest index on a tie). */
+static int ink2cc_verify_pick(Ink2CuChain *ch, int r, int *tok) {
+    const int *w = ch && ch->vpick ? (const int *)cc_ptr(ch->vpick) : NULL;
+    if (!w || r < 0) return 0;
+    *tok = w[2 * r];
+    return 1;
+}
+/* Row r's logits down (unpad_vocab floats, as the head left them: ink2_head_post is the
+ * caller's), and the frame's device work finished. */
+static int ink2cc_verify_row(Ink2CuChain *ch, int r, float *out, int V) {
+    if (!ch || !ch->vlog || r < 0) return 0;
+    return cc_read(ch->vlog, (size_t)r * (size_t)V, out, (size_t)V * sizeof(float));
+}
+/* Back to the state after the verify's first `keep` rows (its rows at pos0..pos0+keep-1) and
+ * `keep` positions fed: the convolution states are the host's copy from before the verify
+ * (ink2cc_host_wrote makes the next frame's push upload them), and the rows that stood are fed
+ * again -- one forward of `keep` rows, the bits a plain step gives them -- so every state
+ * layer's convolution holds them and not the drafts that were rejected. The K/V rows past
+ * `keep` stay in the host's ring where they are and are overwritten when those positions are
+ * fed again; the mirror is only read up to the fed positions, so they are never attended to. */
+static int ink2cc_spec_rollback(Model *m, const int *ids, int keep, int pos0, float *logit) {
+    Ink2CuChain *ch = ink2cc_of(m);
+    if (!ch || keep < 1) return 0;
+    Cfg *c = &m->c; int D = c->hidden;
+    m->kv_len = pos0 + keep;
+    if (m->kvp.len > pos0 + keep) m->kvp.len = pos0 + keep;
+    float *x = falloc((int64_t)keep * D);
+    if (!x) return 0;
+    for (int s = 0; s < keep; s++) {
+        wt_row_f32(m->embed, (int64_t)ids[s] * D, x + (int64_t)s * D, D);
+        if (m->embed_norm) rmsnorm_row(x + (int64_t)s * D, x + (int64_t)s * D, m->embed_norm, D, c->eps);
+    }
+    int took = ink2cc_forward(m, x, keep, pos0, 0, logit, 0);
+    free(x);
+    if (!took) return 0;
+    m->kv_len = pos0 + keep;
+    kv_prefix_record(&m->kvp, ids, pos0, keep);
+    return 1;
 }
 
 static void ink2cc_report(Model *m) {

@@ -3859,7 +3859,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
 #ifdef COLI_CUDA
     if (!chain_logit && g_cu_chain) {   /* Inkling-2's CUDA chain (inkling2_cuchain.h) */
         chain_logit = falloc(c->unpad_vocab);
-        int took = ink2cc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit);
+        int took = ink2cc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit, 1);
         if (took != 1) { free(chain_logit); chain_logit = NULL; }
         if (!took && !coli_prompt_broken()) ink2cc_cpu_step(m, pos0, S);
     }
@@ -3870,7 +3870,7 @@ static float *step_mm(Model *m, const int *ids, int S, int pos0, int *tf_out,
     float *chain_logit = NULL;
     if (g_cu_chain) {   /* Inkling-2's CUDA chain (inkling2_cuchain.h) */
         chain_logit = falloc(c->unpad_vocab);
-        int took = ink2cc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit);
+        int took = ink2cc_forward(m, x, S, pos0, (g_echo_k > 0 && g_echo_id && S > 1) || tf_out != NULL, chain_logit, 1);
         if (took != 1) { free(chain_logit); chain_logit = NULL; }
         if (!took && !coli_prompt_broken()) ink2cc_cpu_step(m, pos0, S);
     }
@@ -3955,6 +3955,256 @@ static float *step(Model *m, const int *ids, int S, int pos0, int *tf_out) {
 }
 
 #include "inkling2_mtp.h"   /* Inkling-2's drafter (INK2_MTP=1) */
+
+/* ---------- prompt-lookup speculation (INK2_SPEC=1, CUDA chain) ----------
+ * The zero-weight half of a drafter: the token history proposes what follows itself
+ * (spec_draft.h's spec_lookup -- the longest n-gram of the context that repeats ends it, and
+ * the tokens that followed it there are the drafts), one forward of the chain verifies them,
+ * and only the prefix the target's own greedy picks agree with is kept. No token changes:
+ * every draft goes through the same forward as a decode step, and the ones that stand are
+ * exactly the picks plain decoding makes.
+ *
+ * One verify of S = drafts + 1 rows: row r is the token fed at pos + r (row 0 the token the
+ * caller just emitted), so row r's logits predict pos + r + 1 and draft r (ids[r]) stands when
+ * row r - 1 picks it. The chain leaves every row's pick on the device (ink2cc_forward's nlog),
+ * so the loop compares the picks before the vocabulary comes down and reads back only the rows
+ * that stood. On a rejection after `keep` rows the convolution states go back
+ * to the copy taken before the verify and those `keep` rows are fed again in one forward --
+ * the same bits plain decoding gives them -- because a short convolution's state is the tail
+ * of the rows it saw and nothing here can step it back a row at a time (the K/V rows are
+ * positional and simply stop being read).
+ *
+ * Whether a proposal is drafted is the gate's call (spec_draft.h): the measured acceptance by
+ * draft position and the measured cost of a verify of that many rows. INK2_SPEC_GATE=0 drafts
+ * every proposal in full (tests). Greedy only, one conversation, the chain on, the checkpoint's
+ * own drafter off. */
+#define INK2_SPEC_ROWS 5           /* a verify's rows at most: 4 drafts + the token before them */
+#ifdef COLI_CUDA
+#include "spec_draft.h"
+typedef struct {
+    int on;                        /* INK2_SPEC=1 and the chain can take a verify */
+    int dead;                      /* a verify the chain did not take: plain steps from here */
+    int maxd;                     /* INK2_SPEC_DRAFTS: drafts a verify, 1..INK2_SPEC_ROWS-1 */
+    SpecGate gate;
+    int *hist; int hist_n, hist_cap;    /* the token ids fed so far, by position */
+    int ids[INK2_SPEC_ROWS];            /* the last verify's rows */
+    int ahead_n, ahead_i, ahead_pos;    /* its rows the caller has not consumed yet, and where they start */
+    float *ahead;                       /* their logits, row r at r*vocab (softcapped) */
+    float **cs_save; int cs_save_n;      /* m->cs before the verify, [4][n_state] */
+    unsigned long long tokens, forwards, verifies, drafts, accepted;
+} Ink2Spec;
+
+static Ink2Spec g_ink2_spec;
+
+static int ink2_spec_alloc(Model *m, Ink2Spec *sp) {
+    Cfg *c = &m->c;
+    if (sp->ahead) return sp->cs_save_n == c->n_state;
+    sp->hist_cap = 1 << 16;
+    sp->hist = malloc((size_t)sp->hist_cap * sizeof(int));
+    sp->ahead = malloc((size_t)INK2_SPEC_ROWS * c->unpad_vocab * sizeof(float));
+    sp->cs_save = calloc((size_t)4 * c->n_state, sizeof(float *));
+    if (!sp->hist || !sp->ahead || !sp->cs_save) { free(sp->hist); free(sp->ahead); free(sp->cs_save);
+                                                   sp->hist = NULL; sp->ahead = NULL; sp->cs_save = NULL; return 0; }
+    for (int i = 0; i < c->n_state; i++) for (int b = 0; b < 4; b++) {
+        int64_t nc = ink_cs_cells(c, b, i);
+        if (nc && !(sp->cs_save[(size_t)b * c->n_state + i] = malloc((size_t)nc * sizeof(float)))) return 0;
+    }
+    sp->cs_save_n = c->n_state;
+    return 1;
+}
+/* The history from the prompt, the gate from the environment: NULL when speculation is off. */
+static Ink2Spec *ink2_spec_begin(Model *m, const int *prompt, int np, int n_new, int dump) {
+    const char *e = getenv("INK2_SPEC");
+    Ink2Spec *sp = &g_ink2_spec;
+    /* the buffers outlive a run (a prompt file reuses them) */
+    int *hist = sp->hist; float *ahead = sp->ahead; float **cs = sp->cs_save; int csn = sp->cs_save_n;
+    memset(sp, 0, sizeof *sp);
+    sp->hist = hist; sp->ahead = ahead; sp->cs_save = cs; sp->cs_save_n = csn;
+    if (!(e && *e == '1') || n_new <= 1 || dump || m->mtp) return NULL;
+    if (!g_cu_chain || g_cu_chain != 1 || m->c.n_shared > 0) return NULL;
+    if (!ink2cc_spec_ready(m, 2, np)) {
+        fprintf(stderr, "[inkling2 spec] INK2_SPEC: the chain does not take a verify here; plain decoding\n");
+        return NULL;
+    }
+    if (!ink2_spec_alloc(m, sp)) { fprintf(stderr, "[inkling2 spec] INK2_SPEC: out of host memory; plain decoding\n"); return NULL; }
+    sp->maxd = INK2_SPEC_ROWS - 1;   /* 4: the gate trims it per step (INK2_SPEC_DRAFTS) */
+    const char *d = getenv("INK2_SPEC_DRAFTS");
+    if (d && *d) sp->maxd = atoi(d);
+    if (sp->maxd < 1 || sp->maxd > INK2_SPEC_ROWS - 1) {
+        fprintf(stderr, "INK2_SPEC_DRAFTS must be 1..%d\n", INK2_SPEC_ROWS - 1); exit(1);
+    }
+    const char *g = getenv("INK2_SPEC_GATE");
+    spec_gate_init(&sp->gate, g && *g == '0');
+    sp->hist_n = 0;
+    for (int i = 0; i < np && i < sp->hist_cap; i++) sp->hist[i] = prompt[i];
+    sp->hist_n = np < sp->hist_cap ? np : 0;
+    sp->on = 1;
+    fprintf(stderr, "[inkling2 spec] prompt lookup on: up to %d drafts a verify, the gate %s\n",
+            sp->maxd, sp->gate.off ? "off (every proposal drafted)" : "on");
+    return sp;
+}
+static void ink2_spec_hist_push(Ink2Spec *sp, int tok, int pos) {
+    if (pos < 0 || pos >= sp->hist_cap || pos != sp->hist_n) {
+        if (getenv("INK2_SPEC_DEBUG"))
+            fprintf(stderr, "[ink2spec] history breaks at pos %d (held %d); speculation off\n", pos, sp->hist_n);
+        sp->on = 0; return;
+    }
+    sp->hist[pos] = tok;
+    sp->hist_n = pos + 1;
+}
+static void ink2_spec_save_cs(Model *m, Ink2Spec *sp) {
+    Cfg *c = &m->c;
+    if (sp->cs_save_n != c->n_state) return;
+    for (int i = 0; i < c->n_state; i++) for (int b = 0; b < 4; b++)
+        memcpy(sp->cs_save[(size_t)b * c->n_state + i], m->cs[b][i],
+               (size_t)ink_cs_cells(c, b, i) * sizeof(float));
+}
+static void ink2_spec_restore_cs(Model *m, Ink2Spec *sp) {
+    Cfg *c = &m->c;
+    for (int i = 0; i < c->n_state; i++) for (int b = 0; b < 4; b++)
+        memcpy(m->cs[b][i], sp->cs_save[(size_t)b * c->n_state + i],
+               (size_t)ink_cs_cells(c, b, i) * sizeof(float));
+    ink2cc_host_wrote(m, 0);   /* the device's copy goes back before its next step */
+}
+/* The verify: S rows from ids at pos, every row's pick on the device. 1 taken, 0 the chain
+ * declined (nothing consumed: the caller runs a plain step), -1 the prompt broke off. */
+static int ink2_spec_verify(Model *m, const int *ids, int S, int pos) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *x = falloc((int64_t)S * D), *tmp = falloc(c->unpad_vocab);
+    for (int s = 0; s < S; s++) {
+        wt_row_f32(m->embed, (int64_t)ids[s] * D, x + (int64_t)s * D, D);
+        if (m->embed_norm) rmsnorm_row(x + (int64_t)s * D, x + (int64_t)s * D, m->embed_norm, D, c->eps);
+    }
+    int took = ink2cc_forward(m, x, S, pos, 0, tmp, S);
+    free(x); free(tmp);
+    if (took == 1) {
+        m->kv_len = pos + S;
+        kv_prefix_record(&m->kvp, ids, pos, S);
+        return 1;
+    }
+    return coli_prompt_broken() ? -1 : 0;
+}
+/* The convolution states and the fed positions back to the verify's first `keep` rows, those
+ * rows fed again in one forward so they, not the rejected drafts, are what the next step's
+ * short convolutions see. */
+static int ink2_spec_rollback(Model *m, Ink2Spec *sp, int keep, int pos) {
+    Cfg *c = &m->c;
+    float *tmp = falloc(c->unpad_vocab);
+    ink2_spec_restore_cs(m, sp);
+    int ok = ink2cc_spec_rollback(m, sp->ids, keep, pos, tmp);
+    free(tmp);
+    if (!ok) {   /* the device is gone: the accepted rows go through the CPU path, which the
+                  * lost frame left at `pos` (ink2cc_recover) */
+        for (int r = 0; r < keep; r++) { float *l = step(m, &sp->ids[r], 1, pos + r, NULL); free(l); }
+        m->kv_len = pos + keep;
+        kv_prefix_record(&m->kvp, sp->ids, pos, keep);
+        sp->dead = 1;
+        sp->ahead_n = 0;
+    }
+    return ok;
+}
+/* The verify ended (or the generation did): the drafts it carried that the caller never
+ * consumed are undone, and the gate is told how many stood. */
+static void ink2_spec_settle(Model *m, Ink2Spec *sp, int keep, int rejected) {
+    if (keep < sp->ahead_n) ink2_spec_rollback(m, sp, keep, sp->ahead_pos);
+    spec_gate_result(&sp->gate, SPEC_SRC_LOOKUP, keep - 1 + (rejected ? 1 : 0), keep - 1);
+    sp->ahead_n = sp->ahead_i = 0;
+}
+/* The logits that follow `tok` fed at `pos`, exactly as step(m,&tok,1,pos) gives them; `more`
+ * is how many tokens the caller may still want. The returned buffer is the caller's. */
+static float *ink2_spec_step(Model *m, Ink2Spec *sp, int tok, int pos, int more) {
+    Cfg *c = &m->c; int V = c->unpad_vocab;
+    sp->tokens++;
+    if (sp->on) ink2_spec_hist_push(sp, tok, pos);
+    if (!sp->on) {   /* the history broke: undo a verify still in flight, then plain steps */
+        if (sp->ahead_n) ink2_spec_settle(m, sp, sp->ahead_i, 0);
+        return step(m, &tok, 1, pos, NULL);
+    }
+    if (sp->ahead_n) {   /* a verify's rows still waiting: a draft that matches stands */
+        int i = sp->ahead_i;
+        if (tok == sp->ids[i] && pos == sp->ahead_pos + i) {
+            float *lg = falloc(V);
+            memcpy(lg, sp->ahead + (int64_t)i * V, (size_t)V * sizeof(float));
+            ink2_head_post(c, lg, V);          /* the head's softcap, as step_mm gives it */
+            sp->accepted++;
+            if (++sp->ahead_i == sp->ahead_n) ink2_spec_settle(m, sp, sp->ahead_n, 0);
+            return lg;
+        }
+        ink2_spec_settle(m, sp, i, 1);   /* a draft was rejected: the state goes back to it */
+        if (sp->dead) return step(m, &tok, 1, pos, NULL);
+    }
+    int room = more < sp->maxd ? more : sp->maxd;
+    if (room > 0 && pos + room >= m->max_t) room = m->max_t - 1 - pos;
+    int d[INK2_SPEC_ROWS], k = 0;
+    if (room > 0 && sp->maxd > 0) {
+        int n = spec_lookup(sp->hist, sp->hist_n, 2, 4, room, d);
+        if (n > 0) k = spec_gate_pick(&sp->gate, SPEC_SRC_LOOKUP, n, NULL);
+        if (k > 0 && !ink2cc_spec_ready(m, k + 1, pos)) k = 0;
+    }
+    if (!k) {   /* a plain step */
+        sp->forwards++;
+        double t0 = now_s();
+        float *lg = step(m, &tok, 1, pos, NULL);
+        spec_gate_forward(&sp->gate, 1, now_s() - t0);
+        return lg;
+    }
+    int S = k + 1;
+    sp->ids[0] = tok;
+    memcpy(sp->ids + 1, d, (size_t)k * sizeof(int));
+    ink2_spec_save_cs(m, sp);
+    double t0 = now_s();
+    int took = ink2_spec_verify(m, sp->ids, S, pos);
+    if (took < 0) { sp->ahead_n = 0; return NULL; }   /* the prompt broke off */
+    if (!took) {   /* the chain declined before feeding anything: plain steps from here */
+        sp->dead = 1; sp->ahead_n = 0;
+        return step(m, &tok, 1, pos, NULL);
+    }
+    sp->forwards++; sp->verifies++; sp->drafts += (uint64_t)k;
+    /* how many of the drafts the target's own picks agree with (row r's pick is the token at
+     * pos + r + 1, draft r is ids[r + 1]) */
+    int keep = 1;
+    for (int r = 1; r < S; r++) {
+        int t;
+        if (!ink2cc_verify_pick(ink2cc_of(m), r - 1, &t) || t != sp->ids[r]) break;
+        keep++;
+    }
+    /* the rows that stood, down (row r the logits after pos + r, the caller's one a token). The
+     * picks are compared on the device, so the rows past the first rejection are never read. */
+    float *rows = falloc((int64_t)keep * V);
+    int ok = 1;
+    for (int r = 0; r < keep && ok; r++)
+        ok = ink2cc_verify_row(ink2cc_of(m), r, rows + (int64_t)r * V, V);
+    spec_gate_forward(&sp->gate, S, now_s() - t0);
+    if (!ok) { free(rows); sp->dead = 1; sp->ahead_n = 0; return step(m, &tok, 1, pos, NULL); }
+    sp->ahead_pos = pos; sp->ahead_n = S; sp->ahead_i = 1;
+    memcpy(sp->ahead, rows, (size_t)keep * V * sizeof(float));
+    float *lg = falloc(V);
+    memcpy(lg, rows, (size_t)V * sizeof(float));
+    free(rows);
+    ink2_head_post(c, lg, V);
+    return lg;
+}
+static void ink2_spec_end(Model *m, Ink2Spec *sp) {
+    if (sp->on && sp->ahead_n) ink2_spec_settle(m, sp, sp->ahead_i, 0);
+}
+static void ink2_spec_report(const Ink2Spec *sp, const char *scope) {
+    if (!sp->verifies) {
+        if (getenv("INK2_SPEC_DEBUG"))
+            fprintf(stderr, "[ink2spec] %s: no verify ran (on %d, hist %d, picks %d, declined %d)\n",
+                    scope, sp->on, sp->hist_n, sp->gate.picks[SPEC_SRC_LOOKUP], (int)sp->gate.declined[SPEC_SRC_LOOKUP]);
+        return;
+    }
+    char g[384]; spec_gate_describe(&sp->gate, SPEC_SRC_LOOKUP, g, sizeof g);
+    fprintf(stderr, "[inkling2 spec] %s: %.2f tokens/forward (%llu forwards per %llu tokens) | "
+                    "acceptance %.1f%% (%llu/%llu drafts in %llu verifies, %.2f a verify) | gate %s%s\n",
+            scope, sp->forwards ? (double)sp->tokens / sp->forwards : 0.0,
+            sp->forwards, sp->tokens,
+            sp->drafts ? 100.0 * (double)sp->accepted / (double)sp->drafts : 0.0,
+            sp->accepted, sp->drafts, sp->verifies,
+            sp->verifies ? (double)sp->accepted / (double)sp->verifies : 0.0,
+            sp->gate.off ? "off" : g, sp->dead ? " | chain declined once: off" : "");
+}
+#endif /* COLI_CUDA */
 
 /* ---- several conversations at once (KV_SLOTS>1, serve_mux) ------------------- */
 static void ink_seq_swap(Model *m, InkSeq *q) {
@@ -4231,6 +4481,10 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
         }
         ink2m_report(m);
     }
+#ifdef COLI_CUDA
+    /* INK2_SPEC: prompt-lookup drafts, one verify forward each (above) */
+    Ink2Spec *sp = ink2_spec_begin(m, ids, np, n_new, 0);
+#endif
     for (int s = 0; s < n_new && logit; s++) {
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->unpad_vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
@@ -4242,9 +4496,16 @@ static void generate_stream(Model *m, Tok *T, const char *prompt, int n_new,
         int one = best;
         len++;
         if (s == n_new - 1) break;
+#ifdef COLI_CUDA
+        if (sp) logit = ink2_spec_step(m, sp, one, len - 1, n_new - 1 - s);
+        else
+#endif
         logit = step(m, &one, 1, len - 1, NULL);
     }
     double dt = now_s() - t1;
+#ifdef COLI_CUDA
+    if (sp) { ink2_spec_end(m, sp); ink2_spec_report(sp, "generate"); }
+#endif
     int gen = len - np;
     printf("\n[prefill %.1fs | %d tokens in %.1fs = %.2f tok/s | RSS %.1f GB]\n",
            t1 - t0, gen, dt, gen > 1 ? (gen-1)/dt : 0.0, rss_gb());

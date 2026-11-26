@@ -1,0 +1,445 @@
+{
+  "cell": "prompt-lookup-speculation (INK2_SPEC)",
+  "question": "does the zero-weight drafter (the context's own n-grams) pay in Inkling-2's CUDA chain, and is its text the same as plain decoding?",
+  "design": "spec_lookup drafts up to INK2_SPEC_DRAFTS tokens from the token history; one forward of S = drafts + 1 rows verifies them (row r fed at pos + r, its argmax the token at pos + r + 1); the chain computes every row's final norm, head and argmax on the card (cc_pick_rows) and the loop reads back only the rows the picks agree with; on a rejection the convolution banks go back to the host copy taken before the verify and the accepted prefix is fed again in one forward, K/V rows being positional. Depth is spec_draft.h's gate (measured acceptance by position, measured T(n), fitted rho); INK2_SPEC_GATE=0 drafts every proposal.",
+  "provenance": "measured",
+  "text_identity": [
+    {
+      "size": "721",
+      "prompt_tokens": 721,
+      "gen_tokens": 100,
+      "chars": 3755,
+      "identical": true,
+      "decode_off": 35.3,
+      "decode_on": 42.21,
+      "gain_pct": 19.6
+    },
+    {
+      "size": "8k",
+      "prompt_tokens": 8027,
+      "gen_tokens": 100,
+      "chars": 37454,
+      "identical": true,
+      "decode_off": 34.03,
+      "decode_on": 45.86,
+      "gain_pct": 34.8
+    },
+    {
+      "size": "64k",
+      "prompt_tokens": 63977,
+      "gen_tokens": 32,
+      "chars": 295129,
+      "identical": true,
+      "decode_off": 24.94,
+      "decode_on": 33.07,
+      "gain_pct": 32.6
+    },
+    {
+      "size": "moe0-721",
+      "prompt_tokens": 721,
+      "gen_tokens": 100,
+      "chars": 3755,
+      "identical": true,
+      "decode_off": 34.48,
+      "decode_on": 48.34,
+      "gain_pct": 40.2
+    }
+  ],
+  "rows": [
+    {
+      "cell": "lookup-721-off",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, INK2_SPEC=0",
+      "provenance": "measured",
+      "prompt_tokens": 721,
+      "prefill_s": 4.0,
+      "gen_tokens": 100,
+      "decode_s": 2.8,
+      "decode_tok_s": 35.3,
+      "rss_gb": 8.2,
+      "log": "f0-721.out",
+      "err": "f0-721.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 8.18,
+        "experts": 2520
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 0.8,
+        "expert_mm": 3.4,
+        "shared": 0.0,
+        "attn": 0.9,
+        "other": 1.7
+      }
+    },
+    {
+      "cell": "lookup-721-on",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, INK2_SPEC=1",
+      "provenance": "measured",
+      "prompt_tokens": 721,
+      "prefill_s": 5.4,
+      "gen_tokens": 100,
+      "decode_s": 2.3,
+      "decode_tok_s": 42.21,
+      "rss_gb": 7.7,
+      "log": "f1-721.out",
+      "err": "f1-721.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 8.18,
+        "experts": 2520
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 2.6,
+        "expert_mm": 3.2,
+        "shared": 0.0,
+        "attn": 0.6,
+        "other": 1.3
+      },
+      "tokens_per_forward": 2.91,
+      "forwards": 34,
+      "tokens": 99,
+      "acceptance_pct": 98.5,
+      "accepted_drafts": 65,
+      "drafted": 66,
+      "verifies": 29,
+      "accepted_per_verify": 2.24,
+      "gate": "T(1) 55.8 ms, rows 2:1.12 3:1.11 4:1.26 5:1.65, rho 0.10, acceptance by position 0.97 0.97 0.92 0.75 0.50"
+    },
+    {
+      "cell": "lookup-8k-off",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, INK2_SPEC=0",
+      "provenance": "measured",
+      "prompt_tokens": 8027,
+      "prefill_s": 31.0,
+      "gen_tokens": 100,
+      "decode_s": 2.9,
+      "decode_tok_s": 34.03,
+      "rss_gb": 8.1,
+      "log": "f0-8k.out",
+      "err": "f0-8k.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 8.1,
+        "experts": 2496
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 1.7,
+        "expert_mm": 19.8,
+        "shared": 0.0,
+        "attn": 5.2,
+        "other": 7.2
+      }
+    },
+    {
+      "cell": "lookup-8k-on",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, INK2_SPEC=1",
+      "provenance": "measured",
+      "prompt_tokens": 8027,
+      "prefill_s": 29.5,
+      "gen_tokens": 100,
+      "decode_s": 2.2,
+      "decode_tok_s": 45.86,
+      "rss_gb": 8.0,
+      "log": "f1-8k.out",
+      "err": "f1-8k.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 8.1,
+        "experts": 2496
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 1.6,
+        "expert_mm": 18.4,
+        "shared": 0.0,
+        "attn": 4.8,
+        "other": 6.9
+      },
+      "tokens_per_forward": 3.09,
+      "forwards": 32,
+      "tokens": 99,
+      "acceptance_pct": 94.4,
+      "accepted_drafts": 67,
+      "drafted": 71,
+      "verifies": 27,
+      "accepted_per_verify": 2.48,
+      "gate": "T(1) 50.0 ms, rows 2:0.96 3:1.16 4:1.31 5:1.72, rho 0.10, acceptance by position 0.97 0.93 0.95 0.75 0.50"
+    },
+    {
+      "cell": "lookup-64k-off",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, COLI_VK_TIER_HOST=1, COLI_VK_TIER_HOST_GB=3.2, COLI_CUDA_CHAIN_PROMPT_MOE=1, INK2_SPEC=0",
+      "provenance": "measured",
+      "prompt_tokens": 63977,
+      "prefill_s": 140.7,
+      "gen_tokens": 32,
+      "decode_s": 1.2,
+      "decode_tok_s": 24.94,
+      "rss_gb": 10.8,
+      "log": "f0-64k.out",
+      "err": "f0-64k.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 7.04,
+        "experts": 2161
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 0.0,
+        "expert_mm": 0.5,
+        "shared": 0.0,
+        "attn": 51.1,
+        "other": 90.3
+      }
+    },
+    {
+      "cell": "lookup-64k-on",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, COLI_VK_TIER_HOST=1, COLI_VK_TIER_HOST_GB=3.2, COLI_CUDA_CHAIN_PROMPT_MOE=1, INK2_SPEC=1",
+      "provenance": "measured",
+      "prompt_tokens": 63977,
+      "prefill_s": 140.8,
+      "gen_tokens": 32,
+      "decode_s": 0.9,
+      "decode_tok_s": 33.07,
+      "rss_gb": 10.3,
+      "log": "f1-64k.out",
+      "err": "f1-64k.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 7.04,
+        "experts": 2161
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 0.0,
+        "expert_mm": 0.5,
+        "shared": 0.0,
+        "attn": 51.0,
+        "other": 90.3
+      },
+      "tokens_per_forward": 2.07,
+      "forwards": 15,
+      "tokens": 31,
+      "acceptance_pct": 94.1,
+      "accepted_drafts": 16,
+      "drafted": 17,
+      "verifies": 10,
+      "accepted_per_verify": 1.6,
+      "gate": "T(1) 49.6 ms, rows 2:1.12 3:1.35 4:1.80, rho 0.20, acceptance by position 0.92 0.86 0.67 0.50 0.50"
+    },
+    {
+      "cell": "lookup-moe0-721-off",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, COLI_CUDA_CHAIN_MOE=0, INK2_SPEC=0",
+      "provenance": "measured",
+      "prompt_tokens": 721,
+      "prefill_s": 4.1,
+      "gen_tokens": 100,
+      "decode_s": 2.9,
+      "decode_tok_s": 34.48,
+      "rss_gb": 7.8,
+      "log": "f0-moe0-721.out",
+      "err": "f0-moe0-721.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 8.18,
+        "experts": 2520
+      },
+      "phases_s": {
+        "fill": 1.1,
+        "expert_mm": 3.3,
+        "shared": 0.0,
+        "attn": 0.9,
+        "other": 1.7
+      }
+    },
+    {
+      "cell": "lookup-moe0-721-on",
+      "config": "INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, COLI_CUDA_CHAIN_MOE=0, INK2_SPEC=1",
+      "provenance": "measured",
+      "prompt_tokens": 721,
+      "prefill_s": 4.2,
+      "gen_tokens": 100,
+      "decode_s": 2.0,
+      "decode_tok_s": 48.34,
+      "rss_gb": 7.7,
+      "log": "f1-moe0-721.out",
+      "err": "f1-moe0-721.err",
+      "launch_free_vram_gb": 11.3,
+      "tier": {
+        "budget_gib": 8.18,
+        "experts": 2520
+      },
+      "phases_s": {
+        "fill": 1.2,
+        "expert_mm": 3.1,
+        "shared": 0.0,
+        "attn": 0.6,
+        "other": 1.4
+      },
+      "tokens_per_forward": 3.0,
+      "forwards": 33,
+      "tokens": 99,
+      "acceptance_pct": 98.5,
+      "accepted_drafts": 66,
+      "drafted": 67,
+      "verifies": 28,
+      "accepted_per_verify": 2.36,
+      "gate": "T(1) 39.9 ms, rows 2:1.25 3:1.37 4:1.69 5:2.05, rho 0.22, acceptance by position 0.97 0.97 0.92 0.80 0.50"
+    },
+    {
+      "cell": "lookup-721-d1-gate",
+      "config": "721 tokens, -n 100, CTX_MAX=2000, INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, INK2_SPEC=1 INK2_SPEC_DRAFTS=1",
+      "provenance": "measured",
+      "prompt_tokens": 721,
+      "prefill_s": 5.7,
+      "gen_tokens": 100,
+      "decode_s": 2.5,
+      "decode_tok_s": 39.21,
+      "rss_gb": 7.4,
+      "log": "g1d1.out",
+      "err": "g1d1.err",
+      "launch_free_vram_gb": 11.2,
+      "tier": {
+        "budget_gib": 8.1,
+        "experts": 2496
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 1.3,
+        "expert_mm": 3.6,
+        "shared": 0.0,
+        "attn": 0.7,
+        "other": 2.5
+      },
+      "tokens_per_forward": 1.9,
+      "forwards": 52,
+      "tokens": 99,
+      "acceptance_pct": 100.0,
+      "accepted_drafts": 47,
+      "drafted": 47,
+      "verifies": 47,
+      "accepted_per_verify": 1.0,
+      "gate": "T(1) 42.4 ms, rows 2:1.13, rho 0.14, acceptance by position 0.99 0.50 0.50 0.50 0.50"
+    },
+    {
+      "cell": "lookup-721-d4-gateoff",
+      "config": "721 tokens, -n 100, CTX_MAX=2000, INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, INK2_SPEC=1 INK2_SPEC_GATE=0",
+      "provenance": "measured",
+      "prompt_tokens": 721,
+      "prefill_s": 4.3,
+      "gen_tokens": 100,
+      "decode_s": 1.9,
+      "decode_tok_s": 51.34,
+      "rss_gb": 8.4,
+      "log": "g0d4.out",
+      "err": "g0d4.err",
+      "launch_free_vram_gb": 11.2,
+      "tier": {
+        "budget_gib": 8.1,
+        "experts": 2496
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 1.2,
+        "expert_mm": 3.2,
+        "shared": 0.0,
+        "attn": 0.6,
+        "other": 1.2
+      },
+      "tokens_per_forward": 4.5,
+      "forwards": 22,
+      "tokens": 99,
+      "acceptance_pct": 96.2,
+      "accepted_drafts": 77,
+      "drafted": 80,
+      "verifies": 20,
+      "accepted_per_verify": 3.85,
+      "gate": "off"
+    },
+    {
+      "cell": "lookup-721-d4-gate-2",
+      "config": "721 tokens, -n 100, CTX_MAX=2000, INK2_KV=q4, COLI_CUDA=1, OMP_NUM_THREADS=6, COLI_VK_TIER_BALANCE=0, INK2_SPEC=1 (a second pair, the spread)",
+      "provenance": "measured",
+      "prompt_tokens": 721,
+      "prefill_s": 4.3,
+      "gen_tokens": 100,
+      "decode_s": 2.1,
+      "decode_tok_s": 47.25,
+      "rss_gb": 8.5,
+      "log": "g1d4b.out",
+      "err": "g1d4b.err",
+      "launch_free_vram_gb": 11.2,
+      "tier": {
+        "budget_gib": 8.09,
+        "experts": 2491
+      },
+      "layers_experts_in_frame": [
+        0,
+        24
+      ],
+      "phases_s": {
+        "fill": 1.2,
+        "expert_mm": 3.3,
+        "shared": 0.0,
+        "attn": 0.6,
+        "other": 1.3
+      },
+      "tokens_per_forward": 3.09,
+      "forwards": 32,
+      "tokens": 99,
+      "acceptance_pct": 98.5,
+      "accepted_drafts": 67,
+      "drafted": 68,
+      "verifies": 27,
+      "accepted_per_verify": 2.48,
+      "gate": "T(1) 41.3 ms, rows 2:1.24 3:1.40 4:1.79 5:1.90, rho 0.23, acceptance by position 0.97 0.96 0.92 0.90 0.50"
+    }
+  ],
+  "gates": {
+    "cuda-inkc-check": "all passed (relattn f32/f16/q8/q4, loop gate, ink2 mix/clip/dconv)",
+    "bench/gate.sh (spec off, the default)": {
+      "needle 1K": "FOUND",
+      "2K": "FOUND",
+      "4K": "FOUND",
+      "8K": "FOUND"
+    },
+    "needle_check 4K with INK2_SPEC=1": "FOUND",
+    "needle_depth --tokens 64000": "3 of 3 facts",
+    "logs": [
+      "/var/tmp/scratch/spec/final3.log",
+      "the gate.sh output above (2026-11-26 02:02-02:07)"
+    ]
+  },
+  "notes": [
+    "The bench prompts are the repetitive filler of bench/make_prompts.py, so the lookup fires on nearly every step: these are the lookup drafter's best case, not free text.",
+    "The gate's cost model does not price the replay a rejection costs (one forward of `keep` rows): a rejection at the first draft pays T(S) + T(1) for one token. On these prompts 5-6% of drafts are rejected so it does not show; on free text the acceptance EMA is what stops the drafting.",
+    "The 64K decode is 32 tokens, so the gate has 10 verifies to learn from: 2.07 tokens a forward against 4.50 at depth 4 with the gate off on the 721 cell.",
+    "The 721-token cell is the noisy one: the same configuration measured 42.21 and 48.34 in two back-to-back pairs (COLI_CUDA_CHAIN_MOE makes no difference there: 0 of 24 layers' experts run in the frame either way) and 48.08 against 34.55 on the run before the final rebuild, so read that cell as +20% to +40%."
+  ]
+}
