@@ -1,0 +1,131 @@
+[
+ {
+  "cell": "tier-balance-off",
+  "provenance": "measured",
+  "commit": "075e92b3 + f52d306c tree",
+  "question": "what does the tier's CPU/device balancer do to Inkling-2's decode, and what does Strata's engine suggest instead?",
+  "config": "COLI_VK_TIER_BALANCE=0 (the device takes every resident expert of a step)",
+  "rows": [
+   {
+    "prompt_tokens": 721,
+    "decode_before": 27.68,
+    "decode_after": 33.73,
+    "delta_pct": 21.9,
+    "prefill_before": 6.0,
+    "prefill_after": 4.7,
+    "cpu_share_ms_before": 4217,
+    "cpu_share_ms_after": 2167
+   },
+   {
+    "prompt_tokens": 8027,
+    "decode_before": 24.25,
+    "decode_after": 28.25,
+    "delta_pct": 16.5,
+    "prefill_before": 36.8,
+    "prefill_after": 35.1
+   },
+   {
+    "prompt_tokens": 63977,
+    "decode_before": 18.65,
+    "decode_after": 23.06,
+    "delta_pct": 23.6,
+    "prefill_before": 254.2,
+    "prefill_after": 253.5,
+    "path": "default (host experts)"
+   }
+  ],
+  "why": "the balancer hands a step's resident experts back to the CPU whenever the join waits on the device. Inkling-2's join waits on the dense chain (48 visits, device-bound), not on the experts, so the balancer reads the device as slow at experts and moves them to the slower CPU: 4.2 s of the run's 6.1 s expert time at 721 tokens, 3,930 rows handed over in one 64K run. Off, the device takes them: -2 s of CPU share and +16-24% decode at every context.",
+  "logs": [
+   "/var/tmp/scratch/opencode/colibri-runs/engine-short-BAL0.log",
+   "/var/tmp/scratch/opencode/colibri-runs/engine-8k-bal0.log",
+   "/var/tmp/scratch/opencode/colibri-runs/engine-64k-bal0.log"
+  ]
+ },
+ {
+  "cell": "pool-pinning-with-balance-off",
+  "provenance": "measured",
+  "question": "the prompt-MoE path needs every expert present (residents + pool); can it coexist with balance off?",
+  "rows": [
+   {
+    "config": "prompt-MoE, pool auto, balance on",
+    "prefill_s": 146.6,
+    "decode_tok_s": 19.38,
+    "pool_experts": 945,
+    "prompt_layers_in_frame": 24
+   },
+   {
+    "config": "prompt-MoE, pool auto, balance off",
+    "prefill_s": 226.2,
+    "decode_tok_s": 24.06,
+    "pool_experts": 724,
+    "prompt_layers_in_frame": 0,
+    "note": "the pool shrank to 724 with balance off (2,108 + 724 < 3,072), so no layer had every expert and the prompt path declined"
+   },
+   {
+    "config": "prompt-MoE, pool pinned 3.2 GiB, balance off",
+    "prefill_s": 145.4,
+    "decode_tok_s": 24.39,
+    "pool_experts": 956,
+    "prompt_layers_in_frame": 24,
+    "phases_s": {
+     "expert_mm": 0.6,
+     "attn": 53.4,
+     "other": 92.7
+    },
+    "log": "/var/tmp/scratch/opencode/colibri-runs/engine-64k-best.log"
+   }
+  ],
+  "best_64k": {
+   "prefill_s": 145.4,
+   "decode_tok_s": 24.39,
+   "vs_reference_b12676": {
+    "prefill_s": 393.1,
+    "decode_tok_s": 19.96
+   },
+   "vs_before_tonight": {
+    "prefill_s": 254.2,
+    "decode_tok_s": 18.65
+   }
+  }
+ },
+ {
+  "cell": "strata-engine-anatomy",
+  "provenance": "inspected (installed components 0.1.66; 0.1.69 not fetched)",
+  "binaries": [
+   "components/shapes/inkling2/engine/0.1.66-linux-x86_64-cuda-cuda13/strata-inkling (38.8 MB, model-specific)",
+   "components/engine/0.1.66-.../strata (188.9 MB) + strata-split-2-sm120 / sm86 (multi-GPU split builds)",
+   "archs sm_75/86/89/120 + compute_120, CUDA 13.0"
+  ],
+  "kernels_in_the_inkling_binary": [
+   "k_dspark_swiglu_fused",
+   "k_ink_post_qkv_fused",
+   "qkv_fused",
+   "kv_ctx_fused",
+   "gu_fused",
+   "shortconv_kernel/sconv_kernel",
+   "act_kernel",
+   "dot_kernel",
+   "cudaGraph"
+  ],
+  "drafter": {
+   "flags": [
+    "--mtp on|off (default on, 'about 1 GB less graphics memory and is slower' off)",
+    "--drafting auto|mtp|dflash2|off",
+    "--draft-vocab cjk|en|cyrillic|fr|latin"
+   ],
+   "note": "the draft layer ships in the pack (dspark.* / markov_head tensors, a fused swiglu kernel), and the drafter's output vocabulary is restricted per language - their 'one request at a time' rule"
+  },
+  "other": [
+   "--tune quick|thorough at setup, results persisted; --set <engine setting>",
+   "serve/cpu_affinity.py (the CPU side pinned)",
+   "hybrid placement only when the pack does not fit ('4 GiB is enough to start')"
+  ],
+  "what_transfers": [
+   "1. balance: their engine never hands experts back to the CPU piecewise; our balancer does, and it costs 16-24% decode (measured above)",
+   "2. a first-class drafter with a restricted draft vocabulary: our INK2_MTP exists but our snapshot carries no MTP weights (imported --no-mtp; the GGUF has no mtp tensors), and the 0.40 GB dspark GGUF is not an engine input today",
+   "3. fused per-layer kernels and CUDA graphs: qkv_fused / ink_post_qkv_fused / gu_fused / shortconv_kernel + graph capture against our ~100 ops a layer visit",
+   "4. a model-specialized engine binary per model and arch (their shapes/ component), sm_120 included",
+   "5. NOT the host pool at 12 GB: pool on collapses the VRAM expert budget (2,457 -> 606-724 experts) and decode stays at ~28; keep the pool only as the prompt path's source, pinned"
+  ]
+ }
+]

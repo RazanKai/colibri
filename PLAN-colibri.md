@@ -1177,6 +1177,63 @@ So: **not better than the 40.9 figure on this hardware, and not comparable to it
 bigger card with a heavier quant at 570 tokens. On the same card, same quant, same settings the
 engine is 30% ahead of the reference at 721 tokens, 13% at 8K, level at 64K, and alone at 250K.
 
+## 15.18 What Strata's engine shows, and the tier's balance switch (+22–24% decode)
+
+Strata's 0.1.66 components were taken apart (the 0.1.69 update did not fetch). Their decode design,
+in the binaries' own names: a **model-specific engine** (`components/shapes/inkling2/.../strata-inkling`,
+38.8 MB, sm_75/86/89/**120**), a few **big fused kernels** (`qkv_fused`, `ink_post_qkv_fused`,
+`gu_fused`, `shortconv_kernel`, `act_kernel`, `dot_kernel`, `k_dspark_swiglu_fused`) and **CUDA
+graphs**; a **drafter shipped in the pack** (`--mtp` on by default, "about 1 GB less graphics memory
+and is slower" when off, `--drafting auto|mtp|dflash2|off`) with a **restricted draft vocabulary**
+(`--draft-vocab cjk|en|…`); per-machine `--tune` persisted; the CPU side pinned
+(`serve/cpu_affinity.py`); hybrid placement only when the pack does not fit. Their 93.9–101.4 tok/s
+on an RTX 5070 (§15.17) is with that drafter on and a pack that fits whole.
+
+**What we could measure immediately is the placement policy**, and it is the biggest decode win of
+the sync: `COLI_VK_TIER_BALANCE=0` (`bench/results-strata-lessons.json`):
+
+| context | decode before | **with balance off** | prefill before → after |
+|---|---:|---:|---:|
+| 721 tok | 27.68 | **33.73 (+21.9%)** | 6.0 → 4.7 s |
+| 8,027 | 24.25 | **28.25 (+16.5%)** | 36.8 → 35.1 s |
+| 63,977 (default path) | 18.65 | **23.06 (+23.6%)** | 254.2 → 253.5 s |
+
+Why: the balancer hands a step's resident experts to the CPU whenever the join waits on the device.
+Inkling-2's join waits on the **dense chain** (48 visits, device-bound), not on the experts, so the
+balancer reads the device as slow at experts and moves them to the slower CPU — 4.2 s of the run's
+6.1 s expert time at 721 tokens, 3,930 rows handed over in one 64K run. Off, the device takes them
+and the CPU share halves. This is a fixable upstream behaviour, not just a knob: the balance signal
+should be the experts' device time, not the whole join.
+
+With balance off the host pool must be **sized**, or the prompt path loses its "every expert
+present" precondition (auto: 945 experts, pool 2,108 + 945 = 3,053 with balance on; **724** with it
+off → 0 of 24 layers). Pinned with `COLI_VK_TIER_HOST_GB=3.2` it holds 956 and all 24 layers qualify:
+
+| 64K q4, best config (`BALANCE=0 HOST=1 HOST_GB=3.2 PROMPT_MOE=1`) | before tonight |
+|---|---:|---:|
+| prefill | **145.4 s** (440 tok/s) | 254.2 s (18.65 tok/s decode) |
+| decode | **24.39 tok/s** | 18.65 |
+| phases | expert-mm 0.6 / attn 53.4 / other 92.7 | — |
+
+Against the b12676 reference at 64K (393.1 s, 19.96 tok/s) that is **2.7× prefill and +22%
+decode**; against Strata's reproduced cell (657–684 tok/s, 3.4–3.9 tok/s) it is 1.5× on prompt and
+6–7× on decode.
+
+**What is left to take from them, in order** (each still open):
+
+1. **A first-class drafter with a restricted draft vocabulary.** Our `INK2_MTP` exists but our
+   snapshot carries no MTP weights (imported `--no-mtp`; the GGUF has no `mtp`/`dspark` tensor),
+   and the 0.40 GB `dspark-Inkling-2-Mini-Q8_0.gguf` is not an engine input. Their drafter is +1 GB
+   VRAM (which is why their 10.47 GB pack still fits) and their `--draft-vocab` idea (the drafter
+   may only guess a language's token set) is what keeps acceptance high enough to pay.
+2. **Fused per-layer kernels + CUDA graphs**: their `qkv_fused` (our three matmuls of one input),
+   `ink_post_qkv_fused` (rope, clip, gate, conv), `gu_fused` (we have it in `cc_moe`), and graph
+   capture of a decode step against our ~100 ops a visit.
+3. **A model-shaped binary per model and arch** (`shapes/`), sm_120 included: we specialize per
+   format at runtime, not the graph.
+4. **NOT their host pool at 12 GB**: with it on the VRAM expert budget collapses (2,457 → 606–724)
+   and decode stays ~28. It is the prompt path's source, pinned, not a residency strategy here.
+
 ## Appendix — benchmark commands
 
 ```bash
