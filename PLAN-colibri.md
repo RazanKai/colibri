@@ -1290,11 +1290,18 @@ forward of S = drafts + 1 rows, and keeps the prefix the target's own greedy pic
   acceptance by draft position from the same run, and it stops drafting when a verify is worth less
   than a plain step (`INK2_SPEC_GATE=0` drafts every proposal, for tests).
 
-**The text does not change.** Token for token identical to `INK2_SPEC=0` at 721 (100 tokens, two
-settings against the final binary; four more earlier), 8,027 (100) and 63,977 (32), and with
-`COLI_CUDA_CHAIN_MOE=0` (the experts on the host, a different step for the verify's rows): the
-accepted drafts (65/66 at 721, 67/71 at 8K, 16/17 at 64K) are the picks plain decoding makes, which is
-the check that the chain's S-row forward gives a row the bits a one-row step gives it.
+**The text does not change -- on prompts whose margins are wide.** Token for token identical to
+`INK2_SPEC=0` at 721 (100 tokens, two settings against the final binary; four more earlier), 8,027
+(100) and 63,977 (32), and with `COLI_CUDA_CHAIN_MOE=0` (the experts on the host, a different step for
+the verify's rows): the accepted drafts (65/66 at 721, 67/71 at 8K, 16/17 at 64K) are the picks plain
+decoding makes, which is the check that the chain's S-row forward gives a row the bits a one-row step
+gives it. **The scope of that claim, measured in §15.20**: this engine's greedy *text* is not
+reproducible across processes on this box -- two runs of the same `INK2_SPEC=0` configuration agreed on
+47/120 free-form items (the tier's per-run pinning/budget differs; the PLAN already says the oracle
+needs `OMP_NUM_THREADS=1 COLI_CUDA=0`). Free-form prompts sit near enough to ties that any bit
+difference flips the text within ~100 tokens, so a cross-run text comparison cannot test the verify
+path; what can is a back-to-back pair in one tier state (the three cells above) and the answers, which
+agree across engines and across spec on/off within the benchmark's noise.
 
 Measured on this tree, this box (one GPU process, `COLI_VK_TIER_BALANCE=0`, `INK2_KV=q4`,
 `OMP_NUM_THREADS=6`; the bench prompts are the repetitive filler of `bench/make_prompts.py`, so this is
@@ -1393,6 +1400,58 @@ would turn into a copy and which would let the gate draft deeper on free text.
 
 
 ```bash
+## 15.20 Four engines on a real task: a quality tie, llama.cpp a third behind on speed, and this engine's text is not reproducible across processes
+
+The decode numbers are throughput. This asks whether the engines *answer* the same, on data with
+ground truth, with the same weights and the same card:
+
+- **GSM8K**, the first 60 items of OpenAI's `grade-school-math` test set (real ground truth: the
+  number after the dataset's `####`);
+- **code tracing**, 60 one-line Python snippets from 20 templates (seed 20261126) whose gold is
+  **what `python3 -c` actually prints** -- executed by the harness, not written by hand;
+- one prompt a line through each engine, the model's own chat framing as literal text
+  (`<|message_system|>` with effort 0, `<|message_user|>`, `<|message_model|><|content_text|>`),
+  greedy, `n_predict` 192, exact match on the value after the prompt's `####` anchor;
+- engines: this branch (`INK2_SPEC=0` twice and `=1`), `origin/dev` `c29ac0a1` (f32 KV, its only
+  mode), llama.cpp b12676 (q4_0 KV, `-ngl 99 --n-cpu-moe 12`); `COLI_VK_TIER_BALANCE=0` for the two
+  colibri trees.
+
+SWE-bench was considered and rejected: it needs an agent loop, a container and a model far larger
+than this one; on 11.7 GB of IQ3_XXS every engine would score 0 and the table would say nothing
+about the engines. `bench/results-quality.json` has every field.
+
+| engine | GSM8K (60) | code (60) | all (120) | decode tok/s |
+|---|---:|---:|---:|---:|
+| colibri origin/dev `c29ac0a1` | 76.7% | 98.3% | **87.5%** | 33.83 |
+| this branch, `INK2_SPEC=0` (run 1) | 75.0% | 98.3% | 86.7% | 33.48 |
+| this branch, `INK2_SPEC=0` (run 2) | 75.0% | 96.7% | 85.8% | 34.93 |
+| this branch, `INK2_SPEC=1` | 71.7% | 98.3% | 85.0% | **35.00** |
+| llama.cpp b12676 | 73.3% | 98.3% | 85.8% | 22.22 |
+
+**A four-way tie on quality.** 60 items put a 1-sigma of ±5.6 points on each cell, so the 1-2 item
+spread (71.7-76.7%) is noise and the ranking flips between two runs of the *same* engine; the code
+task is at the ceiling for all four (59/60, the same item missed). On speed at this workload (short
+prompts, ~70-token answers) the branch and dev tie at 33.5-35.0 tok/s and llama.cpp is 34% behind
+(22.2) -- the same ordering the long-context cells show, without the branch's long-context advantage
+(typed KV, which this workload does not touch).
+
+**What it found that matters more: the greedy text is not reproducible across processes.** Two runs
+of the *same* configuration (`INK2_SPEC=0`, budgets 2512 and 2492 experts, pin sets 1104 and 1176)
+produced the same text on **47/120** items; `INK2_SPEC=1` vs `INK2_SPEC=0` at the same budget (2492
+both) agreed on **50/120**. So the item-level text comparison measures the engine's own run-to-run
+variation, not the speculative path -- and it is not the speculative path, because spec-off vs
+spec-off shows the same rate. The PLAN has already recorded that a greedy run is not bit-reproducible
+on this box (the oracle needs `OMP_NUM_THREADS=1 COLI_CUDA=0`); free-form prompts sit close enough to
+ties that a bit difference anywhere flips the text within ~100 tokens. Where the difference comes from
+(the host MoE's accumulation order, the tier's per-run pinning/budget, OpenMP scheduling) is **not
+isolated**. What still stands for the verify path is what was measured back to back in one tier state:
+§15.19's three long cells (token-identical) and a one-item probe (a plain step and a one-draft verify
+gave the same 24 tokens).
+
+The consequence for the repo: "the text is identical" is a statement to be made only about a
+back-to-back pair in one tier state, never about two separate runs; and the branch's `INK2_SPEC`
+stays off by default on the strength of the speed cells, not of a general bit-identity claim.
+
 ## Appendix — benchmark commands
 
 ```bash
@@ -1421,10 +1480,15 @@ SNAP=/path/iq3xxs.colibri CTX_MAX=262144 INK2_KV=q4 COLI_CUDA=1 \
 
 # A/B the attention kernel (0 = the per-(head,row) kernel)
 COLI_CUDA_RELATTN_QT=0 SNAP=... CTX_MAX=70000 INK2_KV=q4 ./c/inkling -f bench/prompt-64k.txt -n 32
+
+# the engine-quality benchmark of 15.20 (GSM8K + execution-grounded code; downloads GSM8K once)
+python3 bench/bench_quality_make.py 60 60
+python3 bench/bench_quality_run_colibri.py ./c/inkling ours-spec0 INK2_SPEC=0 INK2_KV=q4
+python3 bench/bench_quality_run_llama.py llama
+python3 bench/bench_quality_score.py
 ```
 
-`bench/run_bench.py` runs 8K/32K/64K and writes `bench/results.json`;
-`bench/unsloth_64k.py` is the llama.cpp baseline; `bench/results-kv.json` holds the runs in
+`bench/run_bench.py` runs 8K/32K/64K and writes `bench/results.json`;`bench/unsloth_64k.py` is the llama.cpp baseline; `bench/results-kv.json` holds the runs in
 §2.1 (q4/f16 8K, 32K/64K q4, 64K scalar A/B, 250K) with their logs under
 `/var/tmp/scratch/kvtest/` on this box.
 

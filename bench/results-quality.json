@@ -1,0 +1,41 @@
+{
+  "cell": "engine-quality-benchmark",
+  "provenance": "measured",
+  "date": "2026-11-26",
+  "question": "same weights, same card: do this branch, colibri origin/dev and llama.cpp b12676 answer a real task equally well, and how fast?",
+  "benchmark": {
+    "gsm8k": "the first 60 items of OpenAI's grade-school-math test.jsonl (real ground truth: the number after ####)",
+    "code": "60 Python-tracing items from 20 one-line templates (seed 20261126); gold = what `python3 -c <snippet>` actually prints, run by the harness, not written by hand",
+    "protocol": "one prompt a line through each engine, the model's own chat framing as literal text (<|message_system|> Thinking effort level: 0, <|message_user|>, <|message_model|><|content_text|>), greedy, n_predict 192, exact match on the value after the prompt's '####' anchor",
+    "why_not_swebench": "SWE-bench needs an agent loop, a container and a much larger model; on 11.7 GB of IQ3_XXS every engine would score 0 and the table would say nothing about the engines"
+  },
+  "engines": [
+    {"engine": "colibri origin/dev c29ac0a1", "kv": "f32 (dev has no typed KV)", "flags": "COLI_VK_TIER_BALANCE=0",
+     "tier": "7.70 GiB = 2371 experts", "launch_free_vram_gb": 11.3, "wall_s": 332.5,
+     "aggregate_decode_tok_s": 33.83, "gsm8k": "46/60 = 76.7%", "code": "59/60 = 98.3%", "all": "105/120 = 87.5%"},
+    {"engine": "this branch, INK2_SPEC=0 (run 1)", "kv": "q4", "flags": "COLI_VK_TIER_BALANCE=0",
+     "tier": "8.15 GiB = 2512 experts", "launch_free_vram_gb": 11.2, "wall_s": 327.2,
+     "aggregate_decode_tok_s": 33.48, "gsm8k": "45/60 = 75.0%", "code": "59/60 = 98.3%", "all": "104/120 = 86.7%"},
+    {"engine": "this branch, INK2_SPEC=0 (run 2, the control)", "kv": "q4", "flags": "COLI_VK_TIER_BALANCE=0",
+     "tier": "8.09 GiB = 2492 experts", "launch_free_vram_gb": 11.2, "wall_s": 312.3,
+     "aggregate_decode_tok_s": 34.93, "gsm8k": "45/60 = 75.0%", "code": "58/60 = 96.7%", "all": "103/120 = 85.8%"},
+    {"engine": "this branch, INK2_SPEC=1 (clean run)", "kv": "q4", "flags": "COLI_VK_TIER_BALANCE=0 INK2_SPEC=1",
+     "tier": "8.09 GiB = 2492 experts", "launch_free_vram_gb": 11.2, "wall_s": 311.8,
+     "aggregate_decode_tok_s": 35.00, "gsm8k": "43/60 = 71.7%", "code": "59/60 = 98.3%", "all": "102/120 = 85.0%"},
+    {"engine": "llama.cpp b12676", "kv": "q4_0", "flags": "-ngl 99 --n-cpu-moe 12 -ctk q4_0 -ctv q4_0 -fa on -b 512 -ub 128",
+     "tier": "n/a (12 layers' experts on the CPU)", "wall_s": 481.8,
+     "aggregate_decode_tok_s": 22.22, "gsm8k": "44/60 = 73.3%", "code": "59/60 = 98.3%", "all": "103/120 = 85.8%"}
+  ],
+  "result": {
+    "quality": "a four-way tie: 60 GSM8K items put a 1-sigma of +-5.6 points on each cell, so a 1-2 item spread (73-77%) is noise; the execution-grounded code task is at the ceiling for every engine (59/60, the one miss is the same item)",
+    "speed_on_this_workload": "this branch 33.5-35.0 tok/s aggregate decode, origin/dev 33.8, llama.cpp 22.2 (-34%); the branch and dev tie at short context (same code, the long-context kernels are not exercised here)",
+    "which_is_best": "no engine is better on quality here; the branch and dev tie on speed at this workload, and llama.cpp is a third behind. The branch's real advantage is the long-context cells this benchmark does not reach (typed KV: 64K and 250K on this card, PLAN 15.18/15.19)"
+  },
+  "the_nondeterminism_finding": {
+    "measured": "two runs of the SAME configuration (this branch, INK2_SPEC=0) produced the same text on 47/120 items; the same-config budgets were 2512 and 2492 experts, the pin sets 1104 and 1176. INK2_SPEC=1 vs a same-budget INK2_SPEC=0 (2492 both) agreed on 50/120 texts.",
+    "conclusion": "the engine's greedy text is not reproducible across processes on this box (the PLAN already says so for the oracle: it needs OMP_NUM_THREADS=1 and COLI_CUDA=0). Free-form prompts sit close enough to ties that a bit-level difference anywhere flips the text within ~100 tokens; the 120-item text comparison therefore MEASURES THE ENGINE'S OWN RUN-TO-RUN VARIATION, not the speculative path.",
+    "what_still_stands": "on the three long cells (PLAN 15.19) the spec-on and spec-off runs were token-identical back to back, and a one-item probe (plain step vs a one-draft verify) produced the same 24 tokens; answers across engines agree on 109/120 items (dev vs llama.cpp), i.e. the same model with different numerics",
+    "not_isolated": "where the run-to-run difference comes from (host MoE accumulation order, the tier's per-run pinning, or OpenMP scheduling) is not isolated; it is not the speculative path, since spec-off vs spec-off shows the same rate"
+  },
+  "logs": ["/var/tmp/scratch/bench/ (items.jsonl, prompts.txt, build-dev.log, out-*.txt, err-*.txt, preds-*.json, run_all.log, probe.log)"]
+}

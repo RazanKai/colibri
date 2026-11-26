@@ -31,6 +31,13 @@ end-to-end retrieval check.
   33.07, 15.18's best config, 32 tokens). The text is token-for-token identical to `INK2_SPEC=0` at
   all three sizes and with `COLI_CUDA_CHAIN_MOE=0`; `gate.sh` and both needles green. A 4K needle
   passes with it on. Not wired into `serve`.
+- **Four-engine task benchmark (PLAN §15.20, `bench/results-quality.json`)**: 60 GSM8K test items +
+  60 execution-grounded code items through this branch (spec off/on), `origin/dev` and llama.cpp
+  b12676: **quality is a four-way tie** (87.5 / 86.7 / 85.8 / 85.0 / 85.8%, ±5.6 pts 1σ; code at the
+  ceiling 59/60), decode 33.5-35.0 tok/s for the two colibri trees against 22.2 for llama.cpp.
+  It also found that this engine's greedy **text is not reproducible across processes** (two runs of
+  the same configuration agreed on 47/120 items; the tier's per-run state), so "identical text" is
+  only a back-to-back-in-one-tier-state claim. See §15.20 before trusting any cross-run text diff.
 - The DSpark GGUF drafter is **still blocked**: its 3-block `dflash`+DSpark variant's forward is in
   no source on this box (§15.19 has the tensor inventory and the exact gap).
 - **The 250K needle passes**: the engine answers `7X4Q-ALPHA-93` at 250,156 tokens. 1K/2K/4K/8K
