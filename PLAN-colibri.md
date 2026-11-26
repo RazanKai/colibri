@@ -1179,8 +1179,9 @@ engine is 30% ahead of the reference at 721 tokens, 13% at 8K, level at 64K, and
 
 ## 15.18 What Strata's engine shows, and the tier's balance switch (+22–24% decode)
 
-Strata's 0.1.66 components were taken apart (the 0.1.69 update did not fetch). Their decode design,
-in the binaries' own names: a **model-specific engine** (`components/shapes/inkling2/.../strata-inkling`,
+Strata's engine components were taken apart, first 0.1.66 (installed) and then the current **0.1.69**
+(Strata 0.2.22, published 2026-11-25 18:52; the model-shaped asset `strata-inkling-0.1.69-linux-x86_64-cuda-cuda13`,
+440 MB, archs 75/80/86/89/120, build `a5bfe0369bfb`). Their decode design, in the binaries' own names: a **model-specific engine** (`components/shapes/inkling2/.../strata-inkling`,
 38.8 MB, sm_75/86/89/**120**), a few **big fused kernels** (`qkv_fused`, `ink_post_qkv_fused`,
 `gu_fused`, `shortconv_kernel`, `act_kernel`, `dot_kernel`, `k_dspark_swiglu_fused`) and **CUDA
 graphs**; a **drafter shipped in the pack** (`--mtp` on by default, "about 1 GB less graphics memory
@@ -1219,19 +1220,51 @@ Against the b12676 reference at 64K (393.1 s, 19.96 tok/s) that is **2.7× prefi
 decode**; against Strata's reproduced cell (657–684 tok/s, 3.4–3.9 tok/s) it is 1.5× on prompt and
 6–7× on decode.
 
+**0.1.69 against 0.1.66, decode side** (symbol and flag diff of the two model-shape binaries and the
+two control components). New kernels: `k_dspark_plain_from_gguf` / `k_dspark_plain` /
+`k_dspark_layout_*` / `k_dspark_wants_f32` (the DSpark drafter now loads **from a GGUF**), 
+`k_ink_quant_x_q8f` + `k_ink_gemm_q8f` (quantize an activation to q8 once and run the GEMM on it),
+`k_ink_moe_fp16tc_v2`, `k_ink_moe_q80_tc`, `k_ink_moe_pf_fp16tc` (tensor-core expert paths incl.
+prefill), `k_ink_stage_plan` / `k_ink_stage_copy` / `k_ink_stage_restore` (a planned staging
+pipeline), `k_ink_topk_pass1` / `k_ink_topk_merge` (two-pass routing), `k_ink_arch_probe`. New
+control flags: `--draft-beam`, `--draft-cost`, `--draft-adapt` / `--no-adapt`, `--draft-plain`,
+`--kv-offload`, `--cache-model`. 0.1.66 already had the model-shaped binary, `qkv_fused`,
+`ink_post_qkv_fused`, `gu_fused`, `shortconv_kernel`, `ctrl_*_small` (the loop's control at decode
+size), `gemv_multi_q8row_preq`, `moe_gu/dn_sk_fmt` and the `pf_*` attention kernels with a device
+`pack_kv` and tiled online softmax with the relative bias and sink.
+
 **What is left to take from them, in order** (each still open):
+
+0. **Prompt-lookup drafting first, then DSpark from the GGUF we already own.** `c/spec_draft.h`
+   already holds `spec_lookup` (n-gram proposals from the context itself — no weights) and the
+   "whether drafting pays" gate, and the engine's verify forward (up to 8 rows) exists. That is
+   the zero-weight half of their drafter and needs no download. Their 0.1.69 shows the second
+   half: the external DSpark drafter **from a GGUF** (`k_dspark_plain_from_gguf`) — the same
+   0.40 GB `dspark-Inkling-2-Mini-Q8_0.gguf` we already have, which our engine cannot read today —
+   with `--draft-beam` / `--draft-cost` / `--draft-adapt` / `--draft-vocab` deciding when and how
+   wide to draft.
 
 1. **A first-class drafter with a restricted draft vocabulary.** Our `INK2_MTP` exists but our
    snapshot carries no MTP weights (imported `--no-mtp`; the GGUF has no `mtp`/`dspark` tensor),
-   and the 0.40 GB `dspark-Inkling-2-Mini-Q8_0.gguf` is not an engine input. Their drafter is +1 GB
-   VRAM (which is why their 10.47 GB pack still fits) and their `--draft-vocab` idea (the drafter
-   may only guess a language's token set) is what keeps acceptance high enough to pay.
-2. **Fused per-layer kernels + CUDA graphs**: their `qkv_fused` (our three matmuls of one input),
+   and the 0.40 GB `dspark-Inkling-2-Mini-Q8_0.gguf` is not an engine input — 0.1.69's
+   `from_gguf` symbol is exactly that gap. Their drafter is +1 GB VRAM (which is why their 10.47 GB
+   pack still fits) and their `--draft-vocab` idea (the drafter may only guess a language's token
+   set) is what keeps acceptance high enough to pay.
+2. **Quantize one activation row once per layer visit** (`k_ink_quant_x_q8f` + `k_ink_gemm_q8f`,
+   and 0.1.66's `gemv_multi_q8row_preq`): our decode runs ~8 separate int8 matmuls per visit
+   (q, k, v, o, router, shared expert) and each re-quantizes the same normalized row. One
+   quantize + N matmuls that read it.
+3. **Pack the KV rows on the device** (`k_ink_pf_pack_kv`): ours is host-side
+   (`ink2cc_kv_down` — P5's ~62 s at 250K) then copied up; a device packer removes the host work
+   and a sync point per layer step.
+4. **Fused per-layer kernels + CUDA graphs**: their `qkv_fused` (our three matmuls of one input),
    `ink_post_qkv_fused` (rope, clip, gate, conv), `gu_fused` (we have it in `cc_moe`), and graph
    capture of a decode step against our ~100 ops a visit.
-3. **A model-shaped binary per model and arch** (`shapes/`), sm_120 included: we specialize per
-   format at runtime, not the graph.
-4. **NOT their host pool at 12 GB**: with it on the VRAM expert budget collapses (2,457 → 606–724)
+5. **A model-shaped binary per model and arch** (`shapes/`), sm_120 included: we specialize per
+   format at runtime, not the graph. 0.1.69's `k_ink_arch_probe` picks per arch.
+6. **Tensor-core expert paths at decode** (`moe_fp16tc_v2`, `moe_q80_tc`, `sk_tc`): our decode
+   experts are warp-per-row GEMV + dp4a; theirs batch the top-k slots onto tensor cores.
+7. **NOT their host pool at 12 GB**: with it on the VRAM expert budget collapses (2,457 → 606–724)
    and decode stays ~28. It is the prompt path's source, pinned, not a residency strategy here.
 
 ## Appendix — benchmark commands
