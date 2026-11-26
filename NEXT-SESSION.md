@@ -38,6 +38,12 @@ end-to-end retrieval check.
   It also found that this engine's greedy **text is not reproducible across processes** (two runs of
   the same configuration agreed on 47/120 items; the tier's per-run state), so "identical text" is
   only a back-to-back-in-one-tier-state claim. See §15.20 before trusting any cross-run text diff.
+- **Strata's 93.9–101.4 tok/s at 32K does not reproduce on this card** (§15.21): their own engine's log
+  shows the 10.47 GB SQ-10 pack is **not** whole-resident (2,604–2,618 of 3,072 experts in VRAM, 454–468
+  on the SSD, 32K of KV partly in host RAM), their `tune auto --plan` says the model "needs no tuning",
+  and a true 32,126-token request decodes at **5.1 tok/s** (fp16 KV) / **13.6** (fp8 + drafter 38/91); the
+  best cell this box gives is 42.5 at 3.9K. Treat the number as a pack/placement statement, not a kernel
+  one; our branch does 24.9–33.1 at 63,977 on the same card.
 - The DSpark GGUF drafter is **still blocked**: its 3-block `dflash`+DSpark variant's forward is in
   no source on this box (§15.19 has the tensor inventory and the exact gap).
 - **The 250K needle passes**: the engine answers `7X4Q-ALPHA-93` at 250,156 tokens. 1K/2K/4K/8K

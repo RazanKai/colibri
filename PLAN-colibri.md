@@ -1452,6 +1452,49 @@ The consequence for the repo: "the text is identical" is a statement to be made 
 back-to-back pair in one tier state, never about two separate runs; and the branch's `INK2_SPEC`
 stays off by default on the strength of the speed cells, not of a general bit-identity claim.
 
+## 15.21 Strata's 93.9–101.4 tok/s at 32K, checked on their own engine: the pack is not whole-resident on this card
+
+The advertisement (§15.18) is a 32K-context decode figure, **with their drafter and a 10.47 GB pack that
+fits whole**. The test is therefore two questions: does their engine put that pack whole on this card,
+and what does it decode at a true 32K sequence? Their own installation answers both, `measured`
+(`bench/results-strata-32k-verify.json`, engine 0.1.66, the SQ-10 pack, 10,471,526,400 B = 9.75 GiB):
+
+- **Their tuner says there is nothing to tune**: `strata tune auto inkling-2-mini-sq-10 --plan` →
+  *"Inkling-2-Mini needs no tuning: its speed and memory placement are set automatically by
+  strata-inkling"*, and `strata presets list` is empty. So the auto placement is the settled state.
+- **The placement, from their log** (`--max-context 32768`, `--draft dspark`):
+  `trunk=1.87 GB`, `experts=2604 VRAM / 468 host` (6.85 GiB in VRAM, the rest read from the SSD through
+  a 509 MiB pinned DMA ring), and `Auto Host KV Offload: global KV = 4608 VRAM + 28160 mapped host
+  tokens (880.0 MiB host RAM)`. With `--kv fp8`: `experts=2618 VRAM / 454 host`, `KV = 11008 VRAM +
+  21760 host`. `--vram-experts-gb 10.0 / 9.5 / 9.0` all end at the same 6.85–6.88 GiB: their own
+  placement caps it, with "1.45–1.48 GiB free VRAM" at the moment it decides.
+- **So the pack is not whole on this card**, and the arithmetic says it cannot be: trunk 1.87 GB + all
+  3,072 experts (~8.5 GB) = 10.4 GB, and 32K of KV (fp16 ~1.0 GB, fp8 ~0.5) plus the DMA ring and the
+  workspace do not fit beside it in the 11.3 GB free at launch.
+
+Measured through their OpenAI endpoint, temp 0, 128 tokens, VRAM sampled at 4 Hz (the pack's VRAM stays
+flat at ~11.6 GB in every row, i.e. no eviction during decode):
+
+| context (actual) | KV | prefill | **decode** | their drafter |
+|---|---|---:|---:|---|
+| 32,126 | fp16 | 628 tok/s | **5.1 tok/s** | 0 drafts (idle) |
+| 32,126 | fp8 | 603 tok/s | **13.6 tok/s** | 38/91 accepted (41.8%) |
+| 8,053 | fp16 | 699 tok/s | 7.3 | 0/0 |
+| 3,934 | fp16, max-ctx 32768 | 508 tok/s | 23.5 | 38/87 (43.7%) |
+| 3,934 | fp16, max-ctx 8192 | 662 tok/s | **42.5** | 38/87 (43.7%) |
+
+At a true 32K sequence their engine does **5.1–13.6 tok/s** here, 7–20× below the advertisement; even the
+best cell this box can produce (3.9K, 42.5) is under half of it. Our branch on the same card does
+**24.9 (spec off) / 33.1 (spec on) at 63,977 tokens** (§15.19) — 2–6× their 32K cell. So 93.9–101.4 is at
+best a **pack/placement statement** measured where the pack and the KV are whole, on something this
+12 GB card is not; it is not a statement that their engine's kernels are 20× ours.
+
+**The other half of the test — our chain on a 10.4 GB pack of the same weights — has no cell yet**: the
+10.47 GB file is Strata's `.strata` v1.1 layout, which this engine does not read; our packs are IQ3_XXS
+11.66 GB and Q4_K_M 16.6 GB, and anything below IQ3 is a listed dead end. That A/B needs a container or
+a sub-IQ3 quant, neither of which is in scope, and it is the one experiment that would separate "their
+engine is faster" from "their placement fits".
+
 ## Appendix — benchmark commands
 
 ```bash

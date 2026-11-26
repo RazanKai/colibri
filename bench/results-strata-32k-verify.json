@@ -1,0 +1,49 @@
+{
+  "cell": "strata-32k-whole-pack-check",
+  "provenance": "measured",
+  "date": "2026-11-26",
+  "question": "is Strata's advertised 93.9-101.4 tok/s decode at 32K real on this card and pack, with --tune settled and the 10.47 GB pack whole-resident?",
+  "answer": "no: their engine puts 2,604-2,618 of 3,072 experts in VRAM (6.85-6.88 GiB) and 454-468 on the SSD, and at 32K it offloads 21,760-28,160 KV tokens to host RAM. Measured decode at 32,126 tokens: 5.1 tok/s (fp16 KV, drafter idle) and 13.6 tok/s (fp8 KV, drafter 38/91 drafts). The best cell found on this box is 42.5 tok/s at 3,934 tokens.",
+  "engine": {
+    "version": "strata-inkling 0.1.66 (shape inkling2, cuda13)",
+    "pack": "/run/media/nazar/Gaaaymes/models/strata/models/inkling-2-mini/Inkling-2-Mini-SQ-10.strata",
+    "pack_bytes": 10471526400,
+    "pack_gib": 9.75,
+    "server": "components/control/0.1.66/serve/server.py, OpenAI /v1/chat/completions, temp 0, max_tokens 128",
+    "tune": "`strata tune auto inkling-2-mini-sq-10 --plan` says: \"Inkling-2-Mini needs no tuning: its speed and memory placement are set automatically by strata-inkling.\" No presets exist (`strata presets list`: none), so the auto placement below IS the settled state."
+  },
+  "residency_their_own_log": {
+    "trunk": "1.87 GB",
+    "experts_vram": "2604-2618 of 3072 (6.85-6.88 GiB)",
+    "experts_ssd": "454-468, read through a 119-slot pinned DMA ring of 509 MiB",
+    "kv_fp16_at_32768": "4608 VRAM + 28160 mapped host tokens (880.0 MiB host RAM)",
+    "kv_fp8_at_32768": "11008 VRAM + 21760 mapped host tokens (350.6 MiB host RAM)",
+    "free_vram_at_placement": "1.45-1.48 GiB",
+    "note": "--vram-experts-gb 10.0 / 9.5 / 9.0 all ended at the same 6.85-6.88 GiB of experts: the engine's own placement caps it, and the whole pack + 32K of KV does not fit in the 11.3 GB free at launch (trunk 1.87 + all experts ~8.5 + KV ~0.5-1.0 + ring/workspace)."
+  },
+  "rows": [
+    {"cell": "32K, fp16 KV, auto", "prompt_tokens": 32126, "prefill_tps": 628.3, "decode_tps": 5.1,
+     "drafts": "0/0", "vram_mib_median": 11640, "config": "max-context 32768, --vram-experts-gb 10.00, --draft dspark"},
+    {"cell": "32K, fp8 KV, auto", "prompt_tokens": 32126, "prefill_tps": 603.3, "decode_tps": 13.6,
+     "drafts": "38/91 accepted (41.8%)", "vram_mib_median": 11577, "config": "max-context 32768, --kv fp8, --vram-experts-gb 9.00, --draft dspark"},
+    {"cell": "8K, fp16 KV, auto", "prompt_tokens": 8053, "prefill_tps": 699.1, "decode_tps": 7.3,
+     "drafts": "0/0", "vram_mib_median": 11664, "config": "max-context 32768, --vram-experts-gb 10.00"},
+    {"cell": "4K, fp16 KV, max-context 32768", "prompt_tokens": 3934, "prefill_tps": 508.4, "decode_tps": 23.5,
+     "drafts": "38/87 accepted (43.7%)", "vram_mib_median": 11572},
+    {"cell": "4K, fp16 KV, max-context 8192", "prompt_tokens": 3934, "prefill_tps": 662.1, "decode_tps": 42.5,
+     "drafts": "38/87 accepted (43.7%)", "vram_mib_median": 11588}
+  ],
+  "compare": {
+    "claim": "93.9-101.4 tok/s decode at 32K on an RTX 5070 with a 10.47 GB pack that fits whole (Strata, advertised)",
+    "measured_32k_best_here": 13.6,
+    "ratio_claim_vs_measured": "6.9x (fp8+drater) to 19.9x (fp16)",
+    "our_branch_same_card": "24.94 tok/s at 63,977 tokens (spec off), 33.07 (spec on), measured on the same box (PLAN 15.19)"
+  },
+  "not_done_and_why": {
+    "our_chain_on_a_10.4 GB_pack": "not possible tonight: the 10.47 GB file is Strata's .strata v1.1 layout, which this engine does not read; our own packs are IQ3_XXS 11.66 GB and Q4_K_M 16.6 GB, and anything below IQ3 is an explicit dead end in the plan. So the pack-controlled A/B (our chain on a 10.4 GB pack of the same weights) still has no cell.",
+    "their_claim_at_a_true_32K_sequence": "not reproducible here in any placement we could reach; the pack is 2,604-2,618/3,072 experts resident and 32K of KV does not fit beside it, so a whole-resident 32K run would need more than this card has."
+  },
+  "logs": ["/var/tmp/scratch/bench/strata-engine-32k-full.log", "/var/tmp/scratch/bench/strata-engine-A.log",
+           "/var/tmp/scratch/bench/strata-engine-B.log", "/var/tmp/scratch/bench/strata-serve-*.log",
+           "/var/tmp/scratch/bench/strata-32k-full.json", "strata-A.json", "strata-B.json"]
+}
