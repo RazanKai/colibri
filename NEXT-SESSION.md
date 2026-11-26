@@ -25,6 +25,14 @@ end-to-end retrieval check.
   11.1–11.4 GB. The band is the tier budget, 5.62–5.91 GiB (free VRAM 11.2–11.6 GB); record both
   with every run and never quote one end as "the" number.
 - 64K: prefill 265.6 s (chunk 1024) / 236.2 s (chunk 2048); decode 16.8–17.2 tok/s.
+- **Prompt-lookup speculation (PLAN §15.19, `INK2_SPEC=1`, default off)** drafts from the token
+  history with no weights and verifies with one S-row forward: decode **+20–40% at 721** (35.30 →
+  42.21 / 47.25 / 48.34 tok/s), **+35% at 8,027** (34.03 → 45.86), **+33% at 63,977** (24.94 →
+  33.07, 15.18's best config, 32 tokens). The text is token-for-token identical to `INK2_SPEC=0` at
+  all three sizes and with `COLI_CUDA_CHAIN_MOE=0`; `gate.sh` and both needles green. A 4K needle
+  passes with it on. Not wired into `serve`.
+- The DSpark GGUF drafter is **still blocked**: its 3-block `dflash`+DSpark variant's forward is in
+  no source on this box (§15.19 has the tensor inventory and the exact gap).
 - **The 250K needle passes**: the engine answers `7X4Q-ALPHA-93` at 250,156 tokens. 1K/2K/4K/8K
   also pass (`bench/needle_check.py --kv q4 --sizes 1,2,4,8`).
 - Attention kernels: prompt path 1.03 → **5.0 TFLOP/s**; decode step 8.03 → 4.15 ms.
@@ -63,15 +71,20 @@ touches exactly that code, so it gates every step there, not just at the end.
    than any effect being tested. The budget follows free VRAM, not
    `CUDA_RESERVE_GB`/`CUDA_EXPERT_GB`.
 3. **DSpark gate** (the official drafter is a *separate* 402 MB `dflash` model,
-   `dspark-Inkling-2-Mini-Q8_0.gguf`, loaded by llama.cpp with `-md`). This engine's `INK2_MTP` is
-   a different mechanism (in-snapshot `<snap>/mtp/mtp.safetensors`, absent here). Price the
-   drafter before building anything: llama.cpp on the same prompt **with and without `-md`**, 8K
-   and 64K (plus 128K if the 64K delta is large), same `ncmoe` and q4 KV. Log prompt/decode tok/s,
-   `draft_n`/`draft_n_accepted` and **accepted tokens per verify step**. The without-`-md` number
-   is the fair comparison for our 16.55 tok/s at 64K. **Decision rule, not a judgement call**: if
-   without-`-md` is within ~10% of the engine's decode at the same context, treat the engine as at
-   parity and drop decode-speed work in favour of prefill; if the drafter delta is large at 64K,
-   check it at 128K before deciding whether the external-drafter path is worth building.
+   `dspark-Inkling-2-Mini-Q8_0.gguf`, loaded by llama.cpp with `-md`). **Priced (§15.19,
+   `bench/results-dspark.json`)**: b12588 on this card measured 77.8% draft acceptance, 2.33
+   accepted a verify, decode +5% at 8K (18.66 → 19.60) and +6% at 64K (16.20 → 17.19); b12676
+   with the same drafter was *worse* (acceptance 0.500, 19.96 → 16.52). The engine's own
+   drafter (`INK2_MTP`) is a different mechanism (in-snapshot `<snap>/mtp/mtp.safetensors`,
+   absent here) and this GGUF cannot feed it. The lookup path (item 0 of 15.18, done: §15.19)
+   needs no weights and is +33% at 64K on the bench prompt. **Blocked on the layout**: the file
+   is a 3-block `dflash` + DSpark drafter (`dspark_fuse`, `dspark_hidden_out`, `joint_proj`, one
+   `markov_w1`, `mask_embd`, `attn_k_ctx`/`attn_v_ctx`, block 8, taps at steps 5/23/41/48) and
+   the model-side graph of that variant is in no source on this box — `src-inkling` master has
+   DeepSeek's DSpark, not Inkling's, and the b12676 build is a binary. Before any code: get the
+   reference source (upstream PR that loads this layout, or the app build's source), confirm the
+   four taps' fusion and `joint_proj`'s 2×256+2×2304 inputs against its forward, and only then
+   port it behind `INK2_SPEC`'s verify.
 4. **Then, with results**: the expert phase is **724 s** and the attention kernel **673 s** at
    250K; a 2.5× kernel saves ~400 s, and the wavefront can beat that only if most of the host
    step actually hides. **The deciding number is the fraction of the host step that overlaps with
